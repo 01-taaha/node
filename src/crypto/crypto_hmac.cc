@@ -13,6 +13,7 @@
 
 namespace node {
 
+using ncrypto::Digest;
 using ncrypto::HMACCtxPointer;
 using v8::Boolean;
 using v8::FunctionCallbackInfo;
@@ -29,9 +30,7 @@ using v8::Uint32;
 using v8::Value;
 
 namespace crypto {
-Hmac::Hmac(Environment* env, Local<Object> wrap)
-    : BaseObject(env, wrap),
-      ctx_(nullptr) {
+Hmac::Hmac(Environment* env, Local<Object> wrap) : BaseObject(env, wrap) {
   MakeWeak();
 }
 
@@ -70,8 +69,8 @@ void Hmac::New(const FunctionCallbackInfo<Value>& args) {
 void Hmac::HmacInit(const char* hash_type, const char* key, int key_len) {
   HandleScope scope(env()->isolate());
 
-  const EVP_MD* md = ncrypto::getDigestByName(hash_type);
-  if (md == nullptr) [[unlikely]] {
+  Digest md = Digest::FromName(hash_type);
+  if (!md) [[unlikely]] {
     return THROW_ERR_CRYPTO_INVALID_DIGEST(
         env(), "Invalid digest: %s", hash_type);
   }
@@ -130,7 +129,7 @@ void Hmac::HmacDigest(const FunctionCallbackInfo<Value>& args) {
     encoding = ParseEncoding(env->isolate(), args[0], BUFFER);
   }
 
-  unsigned char md_value[EVP_MAX_MD_SIZE];
+  unsigned char md_value[Digest::MAX_SIZE];
   ncrypto::Buffer<void> buf{
       .data = md_value,
       .len = sizeof(md_value),
@@ -144,19 +143,14 @@ void Hmac::HmacDigest(const FunctionCallbackInfo<Value>& args) {
     hmac->ctx_.reset();
   }
 
-  Local<Value> error;
-  MaybeLocal<Value> rc =
-      StringBytes::Encode(env->isolate(),
+  Local<Value> ret;
+  if (StringBytes::Encode(env->isolate(),
                           reinterpret_cast<const char*>(md_value),
                           buf.len,
-                          encoding,
-                          &error);
-  if (rc.IsEmpty()) [[unlikely]] {
-    CHECK(!error.IsEmpty());
-    env->isolate()->ThrowException(error);
-    return;
+                          encoding)
+          .ToLocal(&ret)) {
+    args.GetReturnValue().Set(ret);
   }
-  args.GetReturnValue().Set(rc.FromMaybe(Local<Value>()));
 }
 
 HmacConfig::HmacConfig(HmacConfig&& other) noexcept
@@ -176,7 +170,7 @@ HmacConfig& HmacConfig::operator=(HmacConfig&& other) noexcept {
 void HmacConfig::MemoryInfo(MemoryTracker* tracker) const {
   tracker->TrackField("key", key);
   // If the job is sync, then the HmacConfig does not own the data
-  if (job_mode == kCryptoJobAsync) {
+  if (IsCryptoJobAsync(job_mode)) {
     tracker->TrackFieldWithSize("data", data.size());
     tracker->TrackFieldWithSize("signature", signature.size());
   }
@@ -199,9 +193,9 @@ Maybe<void> HmacTraits::AdditionalConfig(
   CHECK(args[offset + 2]->IsObject());  // Key
 
   Utf8Value digest(env->isolate(), args[offset + 1]);
-  params->digest = ncrypto::getDigestByName(digest.ToStringView());
-  if (params->digest == nullptr) [[unlikely]] {
-    THROW_ERR_CRYPTO_INVALID_DIGEST(env, "Invalid digest: %s", *digest);
+  params->digest = Digest::FromName(*digest);
+  if (!params->digest) [[unlikely]] {
+    THROW_ERR_CRYPTO_INVALID_DIGEST(env, "Invalid digest: %s", digest);
     return Nothing<void>();
   }
 
@@ -214,9 +208,7 @@ Maybe<void> HmacTraits::AdditionalConfig(
     THROW_ERR_OUT_OF_RANGE(env, "data is too big");
     return Nothing<void>();
   }
-  params->data = mode == kCryptoJobAsync
-      ? data.ToCopy()
-      : data.ToByteSource();
+  params->data = IsCryptoJobAsync(mode) ? data.ToCopy() : data.ToByteSource();
 
   if (!args[offset + 4]->IsUndefined()) {
     ArrayBufferOrViewContents<char> signature(args[offset + 4]);
@@ -224,18 +216,18 @@ Maybe<void> HmacTraits::AdditionalConfig(
       THROW_ERR_OUT_OF_RANGE(env, "signature is too big");
       return Nothing<void>();
     }
-    params->signature = mode == kCryptoJobAsync
-        ? signature.ToCopy()
-        : signature.ToByteSource();
+    params->signature =
+        IsCryptoJobAsync(mode) ? signature.ToCopy() : signature.ToByteSource();
   }
 
   return JustVoid();
 }
 
-bool HmacTraits::DeriveBits(
-    Environment* env,
-    const HmacConfig& params,
-    ByteSource* out) {
+bool HmacTraits::DeriveBits(Environment* env,
+                            const HmacConfig& params,
+                            ByteSource* out,
+                            CryptoJobMode mode,
+                            CryptoErrorStore* errors) {
   auto ctx = HMACCtxPointer::New();
 
   ncrypto::Buffer<const void> key_buf{
@@ -258,6 +250,7 @@ bool HmacTraits::DeriveBits(
   if (!buf) [[unlikely]]
     return false;
 
+  DCHECK(!buf.isSecure());
   *out = ByteSource::Allocated(buf.release());
 
   return true;
@@ -273,7 +266,8 @@ MaybeLocal<Value> HmacTraits::EncodeOutput(Environment* env,
       return Boolean::New(
           env->isolate(),
           out->size() > 0 && out->size() == params.signature.size() &&
-              memcmp(out->data(), params.signature.data(), out->size()) == 0);
+              CRYPTO_memcmp(
+                  out->data(), params.signature.data(), out->size()) == 0);
   }
   UNREACHABLE();
 }

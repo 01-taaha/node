@@ -35,7 +35,7 @@ for (const bits of [-1, 0, 1]) {
     assert.throws(() => crypto.createDiffieHellman(bits), {
       code: 'ERR_OSSL_BN_BITS_TOO_SMALL',
       name: 'Error',
-      message: /bits too small/,
+      message: /bits[\s_]too[\s_]small/i,
     });
   }
 }
@@ -99,6 +99,28 @@ assert.throws(
   'crypto.getDiffieHellman(\'unknown-group\') ' +
   'failed to throw the expected error.'
 );
+
+{
+  const group = crypto.getDiffieHellman('modp14');
+  const alice = crypto.createDiffieHellman(
+    group.getPrime(), group.getGenerator());
+  const bob = crypto.createDiffieHellman(
+    group.getPrime(), group.getGenerator());
+  bob.generateKeys();
+
+  assert.throws(
+    () => alice.computeSecret(bob.getPublicKey()),
+    {
+      name: 'Error',
+      code: 'ERR_CRYPTO_INVALID_STATE',
+      message: 'Cannot compute shared secret without a private key'
+    });
+
+  alice.generateKeys();
+  assert.deepStrictEqual(
+    alice.computeSecret(bob.getPublicKey()),
+    bob.computeSecret(alice.getPublicKey()));
+}
 
 assert.throws(
   () => crypto.createDiffieHellman('', true),

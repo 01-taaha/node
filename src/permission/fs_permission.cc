@@ -45,9 +45,7 @@ void FreeRecursivelyNode(
     }
   }
 
-  if (node->wildcard_child != nullptr) {
-    delete node->wildcard_child;
-  }
+  delete node->wildcard_child;
   delete node;
 }
 
@@ -71,46 +69,61 @@ bool is_tree_granted(
     resolved_param.erase(0, 2);
   }
 #endif
-  return granted_tree->Lookup(resolved_param, true);
+  auto _is_granted = granted_tree->Lookup(resolved_param, true);
+  node::Debug(env,
+              node::DebugCategory::PERMISSION_MODEL,
+              "Access %d to %s\n",
+              _is_granted,
+              param);
+
+  return _is_granted;
 }
 
-void PrintTree(const node::permission::FSPermission::RadixTree::Node* node,
-               size_t spaces = 0) {
-  std::string whitespace(spaces, ' ');
+static const char* kBoxDrawingsLightUpAndRight = "└─ ";
+static const char* kBoxDrawingsLightVerticalAndRight = "├─ ";
 
+void PrintTree(const node::permission::FSPermission::RadixTree::Node* node,
+               size_t depth = 0,
+               const std::string& branch_prefix = "",
+               bool is_last = true) {
   if (node == nullptr) {
     return;
   }
-  if (node->wildcard_child != nullptr) {
-    node::per_process::Debug(node::DebugCategory::PERMISSION_MODEL,
-                             "%s Wildcard: %s\n",
-                             whitespace,
-                             node->prefix);
-  } else {
-    node::per_process::Debug(node::DebugCategory::PERMISSION_MODEL,
-                             "%s Prefix: %s\n",
-                             whitespace,
-                             node->prefix);
-    if (node->children.size()) {
-      size_t child = 0;
-      for (const auto& pair : node->children) {
-        ++child;
-        node::per_process::Debug(node::DebugCategory::PERMISSION_MODEL,
-                                 "%s Child(%s): %s\n",
-                                 whitespace,
-                                 child,
-                                 std::string(1, pair.first));
-        PrintTree(pair.second, spaces + 2);
+
+  if (depth > 0 || (node->prefix.length() > 0)) {
+    std::string indent;
+
+    if (depth > 0) {
+      indent = branch_prefix;
+      if (is_last) {
+        indent += kBoxDrawingsLightUpAndRight;
+      } else {
+        indent += kBoxDrawingsLightVerticalAndRight;
       }
-      node::per_process::Debug(node::DebugCategory::PERMISSION_MODEL,
-                               "%s End of tree - child(%s)\n",
-                               whitespace,
-                               child);
-    } else {
-      node::per_process::Debug(node::DebugCategory::PERMISSION_MODEL,
-                               "%s End of tree: %s\n",
-                               whitespace,
-                               node->prefix);
+    }
+
+    node::per_process::Debug(
+        node::DebugCategory::PERMISSION_MODEL, "%s%s\n", indent, node->prefix);
+  }
+
+  if (node->children.size() > 0) {
+    size_t count = 0;
+    size_t total = node->children.size();
+
+    std::string next_branch_prefix;
+    if (depth > 0) {
+      next_branch_prefix = branch_prefix;
+      if (is_last) {
+        next_branch_prefix += "   ";
+      } else {
+        next_branch_prefix += "│  ";
+      }
+    }
+
+    for (const auto& pair : node->children) {
+      count++;
+      bool child_is_last = (count == total);
+      PrintTree(pair.second, depth + 1, next_branch_prefix, child_is_last);
     }
   }
 }
@@ -141,15 +154,96 @@ void FSPermission::Apply(Environment* env,
   }
 }
 
+void FSPermission::Drop(Environment* env,
+                        PermissionScope scope,
+                        const std::string_view& param) {
+  if (param.empty()) {
+    // Drop all access for this scope
+    if (scope == PermissionScope::kFileSystemRead ||
+        scope == PermissionScope::kFileSystem) {
+      deny_all_in_ = true;
+      allow_all_in_ = false;
+      granted_in_fs_.Clear();
+      granted_paths_in_.clear();
+    }
+    if (scope == PermissionScope::kFileSystemWrite ||
+        scope == PermissionScope::kFileSystem) {
+      deny_all_out_ = true;
+      allow_all_out_ = false;
+      granted_out_fs_.Clear();
+      granted_paths_out_.clear();
+    }
+    return;
+  }
+
+  // When allowed with *, you can only drop * (no specific paths)
+  std::string resolved = PathResolve(env, {param});
+  if (scope == PermissionScope::kFileSystemRead ||
+      scope == PermissionScope::kFileSystem) {
+    if (!allow_all_in_) {
+      RevokeAccess(PermissionScope::kFileSystemRead, resolved);
+    }
+  }
+  if (scope == PermissionScope::kFileSystemWrite ||
+      scope == PermissionScope::kFileSystem) {
+    if (!allow_all_out_) {
+      RevokeAccess(PermissionScope::kFileSystemWrite, resolved);
+    }
+  }
+}
+
+void FSPermission::RevokeAccess(PermissionScope perm, const std::string& res) {
+  const std::string path = WildcardIfDir(res);
+  if (perm == PermissionScope::kFileSystemRead) {
+    auto it =
+        std::find(granted_paths_in_.begin(), granted_paths_in_.end(), path);
+    if (it != granted_paths_in_.end()) {
+      granted_paths_in_.erase(it);
+      RebuildTree(PermissionScope::kFileSystemRead);
+    }
+  } else if (perm == PermissionScope::kFileSystemWrite) {
+    auto it =
+        std::find(granted_paths_out_.begin(), granted_paths_out_.end(), path);
+    if (it != granted_paths_out_.end()) {
+      granted_paths_out_.erase(it);
+      RebuildTree(PermissionScope::kFileSystemWrite);
+    }
+  }
+}
+
+void FSPermission::RebuildTree(PermissionScope scope) {
+  if (scope == PermissionScope::kFileSystemRead) {
+    granted_in_fs_.Clear();
+    if (granted_paths_in_.empty()) {
+      deny_all_in_ = true;
+    } else {
+      for (const auto& path : granted_paths_in_) {
+        granted_in_fs_.Insert(path);
+      }
+    }
+  } else if (scope == PermissionScope::kFileSystemWrite) {
+    granted_out_fs_.Clear();
+    if (granted_paths_out_.empty()) {
+      deny_all_out_ = true;
+    } else {
+      for (const auto& path : granted_paths_out_) {
+        granted_out_fs_.Insert(path);
+      }
+    }
+  }
+}
+
 void FSPermission::GrantAccess(PermissionScope perm, const std::string& res) {
   const std::string path = WildcardIfDir(res);
   if (perm == PermissionScope::kFileSystemRead &&
       !granted_in_fs_.Lookup(path)) {
     granted_in_fs_.Insert(path);
+    granted_paths_in_.push_back(path);
     deny_all_in_ = false;
   } else if (perm == PermissionScope::kFileSystemWrite &&
              !granted_out_fs_.Lookup(path)) {
     granted_out_fs_.Insert(path);
+    granted_paths_out_.push_back(path);
     deny_all_out_ = false;
   }
 }
@@ -161,13 +255,17 @@ bool FSPermission::is_granted(Environment* env,
     case PermissionScope::kFileSystem:
       return allow_all_in_ && allow_all_out_;
     case PermissionScope::kFileSystemRead:
+      if (param.empty()) {
+        return allow_all_in_;
+      }
       return !deny_all_in_ &&
-             ((param.empty() && allow_all_in_) || allow_all_in_ ||
-              is_tree_granted(env, &granted_in_fs_, param));
+             (allow_all_in_ || is_tree_granted(env, &granted_in_fs_, param));
     case PermissionScope::kFileSystemWrite:
+      if (param.empty()) {
+        return allow_all_out_;
+      }
       return !deny_all_out_ &&
-             ((param.empty() && allow_all_out_) || allow_all_out_ ||
-              is_tree_granted(env, &granted_out_fs_, param));
+             (allow_all_out_ || is_tree_granted(env, &granted_out_fs_, param));
     default:
       return false;
   }
@@ -177,6 +275,16 @@ FSPermission::RadixTree::RadixTree() : root_node_(new Node("")) {}
 
 FSPermission::RadixTree::~RadixTree() {
   FreeRecursivelyNode(root_node_);
+}
+
+void FSPermission::RadixTree::Clear() {
+  for (auto& c : root_node_->children) {
+    FreeRecursivelyNode(c.second);
+  }
+  root_node_->children.clear();
+  delete root_node_->wildcard_child;
+  root_node_->wildcard_child = nullptr;
+  root_node_->is_leaf = false;
 }
 
 bool FSPermission::RadixTree::Lookup(const std::string_view& s,

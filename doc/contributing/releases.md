@@ -30,8 +30,8 @@ official release builds for Node.js, hosted on <https://nodejs.org/>.
   * [14. Push the release tag](#14-push-the-release-tag)
   * [15. Promote and sign the release builds](#15-promote-and-sign-the-release-builds)
   * [16. Check the release](#16-check-the-release)
-  * [17. Create a blog post](#17-create-a-blog-post)
-  * [18. Create the release on GitHub](#18-create-the-release-on-github)
+  * [17. Create the release on GitHub](#17-create-the-release-on-github)
+  * [18. Create a blog post](#18-create-a-blog-post)
   * [19. Announce](#19-announce)
   * [20. Celebrate](#20-celebrate)
 * [LTS releases](#lts-releases)
@@ -110,6 +110,9 @@ The key you use may be a child/subkey of an existing key.
 
 Additionally, full GPG key fingerprints for individuals authorized to release
 should be listed in the Node.js GitHub README.md file.
+
+> It is recommended to sign all commits under the Node.js repository.
+> Run: `git config commit.gpgsign true` inside the `node` folder.
 
 ## How to create a release
 
@@ -269,11 +272,12 @@ $ git reset --hard upstream/vN.x
 The list of patches to include should be listed in the "Next Security Release"
 issue in `nodejs-private`. Ask the security release steward if you're unsure.
 
-The `git node land` tool does not work with the `nodejs-private`
-organization. To land a PR in Node.js private, use `git cherry-pick` to apply
-each commit from the PR. You will also need to manually apply the PR
-metadata (`PR-URL`, `Reviewed-by`, etc.) by amending the commit messages. If
+To use the `git node land` tool to land Pull Requests in the `nodejs-private`
+organization, you need to specify the full URL to the Pull Request and make sure
+you provide a GitHub token with read permission to the private repository. If
 known, additionally include `CVE-ID: CVE-XXXX-XXXXX` in the commit metadata.
+Make sure to sign and push to resulting commit to the private repository and not
+the public one.
 
 **Note**: Do not run CI on the PRs in `nodejs-private` until CI is locked down.
 You can integrate the PRs into the proposal without running full CI.
@@ -311,18 +315,23 @@ git checkout -b v1.2.3-proposal upstream/v1.x-staging
 You can also run:
 
 ```bash
-git node release -S --prepare --security --filterLabel vX.x
+git node release -S --prepare --security=../vulnerabilities.json --filterLabel vX.x
 ```
 
 Example:
 
 ```bash
 git checkout v20.x
-git node release -S --prepare --security --filterLabel v20.x
+git node release -S --prepare --security=../vulnerabilities.json --filterLabel v20.x
 ```
 
 to automate the remaining steps until step 6 or you can perform it manually
-following the below steps.
+following the below steps. For semver-minors, you can pass the new version
+explicitly with `--newVersion` arg:
+
+```bash
+git node release -S --prepare --security=../vulnerabilities.json --filterLabel v20.x --newVersion 20.20.0
+```
 
 <details>
 <summary>Security release</summary>
@@ -475,8 +484,8 @@ are formatted correctly.
 
 If this release includes new APIs then it is necessary to document that they
 were first added in this version. The relevant commits should already include
-`REPLACEME` tags as per the example in the
-[docs README](../../tools/doc/README.md). Check for these tags with
+`REPLACEME` tags (see [Writing Documentation](./api-documentation.md#writing-documentation)).
+Check for these tags with
 
 ```bash
 grep REPLACEME doc/api/*.md
@@ -732,14 +741,33 @@ the build before moving forward. Use the following list as a baseline:
 ### 11. Tag and sign the release commit
 
 Once you have produced builds that you're happy with you can either run
-`git node release --promote`
+`git node release --promote`:
 
 ```bash
-git node release -S --promote https://github.com/nodejs/node/pull/XXXX
+git node release --promote https://github.com/nodejs/node/pull/XXXX -S
 ```
 
 to automate the remaining steps until step 16 or you can perform it manually
 following the below steps.
+
+<details>
+<summary>Security release</summary>
+
+For security releases, NCU should be configured to target the public repository,
+not the private one where the proposal are hosted. Pass the upstream where to
+fetch the proposal from using the `--fetch-from` flag.
+
+When promoting several releases, you can pass multiple URLs:
+
+```bash
+git node release --promote \
+  --fetch-from git@github.com:nodejs-private/node-private.git \
+  https://github.com/nodejs-private/node-private/pull/XXXX \
+  https://github.com/nodejs-private/node-private/pull/XXXX \
+  -S
+```
+
+</details>
 
 ***
 
@@ -1047,21 +1075,43 @@ have the right internal version strings. Check that the API docs are available
 at <https://nodejs.org/api/>. Check that the release catalog files are correct
 at <https://nodejs.org/dist/index.tab> and <https://nodejs.org/dist/index.json>.
 
-### 17. Create a blog post
+### 17. Create the release on GitHub
+
+* Go to the [New release page](https://github.com/nodejs/node/releases/new).
+* Select the tag version you pushed earlier.
+* For release title, copy the title from the changelog.
+* For the description, copy the rest of the changelog entry.
+* If you are not releasing the latest "Current", uncheck
+  "Set as the latest release".
+* Click on the "Publish release" button.
+
+### 18. Create a blog post
 
 There is an automatic build that is kicked off when you promote new builds, so
 within a few minutes nodejs.org will be listing your new version as the latest
-release. However, the blog post is not yet fully automatic.
+release, and a blog post draft PR will be created.
 
-Create a new blog post by running the [nodejs.org release-post.js script][]:
+This is driven by the [`post-release.yml`][] workflow in the `nodejs/node`
+repository, which triggers the [`create-release-post.yml`][] workflow on
+`nodejs/nodejs.org`. The same workflow also triggers a redirect update in the
+[`nodejs/release-cloudflare-worker`](https://github.com/nodejs/release-cloudflare-worker)
+repository. Both steps must complete for the release to be fully available on
+the website.
 
-```bash
-node ./apps/site/scripts/release-post/index.mjs x.y.z
-```
+In the event that [`post-release.yml`][] fails, the **first step should be to
+re-run the failed action** rather than manually triggering workflows in other
+repositories. Skipping steps in the process can result in the blog post being
+published without the release documents being available, or without the
+Cloudflare redirects being updated.
 
-This script will use the promoted builds and changelog to generate the post. Run
-`npm run serve` to preview the post locally before pushing to the
-[nodejs.org repository][].
+If the failed action continues to fail after re-running, you can manually
+trigger both of the following:
+
+1. The [`create-release-post.yml`][] workflow on the `nodejs/nodejs.org`
+   repository.
+2. The release worker update on the
+   [`nodejs/release-cloudflare-worker`](https://github.com/nodejs/release-cloudflare-worker)
+   repository.
 
 * You can add a short blurb just under the main heading if you want to say
   something important, otherwise the text should be publication ready.
@@ -1076,38 +1126,18 @@ This script will use the promoted builds and changelog to generate the post. Run
   to reflect those changes.
 
 * Always use pull-requests on the [nodejs.org repository][]. Be respectful
-  of the website team, but you do not have to wait for PR sign-off. Please
-  use the following commit message format:
-
-  ```console
-  Blog: vX.Y.Z release post
-
-  Refs: <full URL to your release proposal PR>
-  ```
-
-* In order to trigger the CI Checks of the [nodejs.org repository][]; Please
-  attach the `github_actions:pull-request` label to the PR.
+  of the website team, but you do not have to wait for PR sign-off.
 
 * Changes to the base branch, `main`, on the [nodejs.org repository][] will
   trigger a new build of nodejs.org, so your changes should appear a few minutes
   after pushing. You can follow the [Deployments](https://github.com/nodejs/nodejs.org/deployments) page
   to see when the build finishes and gets published.
 
-### 18. Create the release on GitHub
-
-* Go to the [New release page](https://github.com/nodejs/node/releases/new).
-* Select the tag version you pushed earlier.
-* For release title, copy the title from the changelog.
-* For the description, copy the rest of the changelog entry.
-* If you are not releasing the latest "Current", uncheck
-  "Set as the latest release".
-* Click on the "Publish release" button.
-
 ### 19. Announce
 
 The nodejs.org website will automatically rebuild and include the new version.
 To announce the build on social media, please ping the @nodejs-social-team
-on offical slack channel.
+on official slack channel.
 
 Node.js is also available on Bluesky and a release announcement can be
 reposted using [nodejs/bluesky](https://github.com/nodejs/bluesky) repository.
@@ -1308,8 +1338,7 @@ branch. This branch will contain the draft release commit (with the draft
 changelog).
 
 Notify the `@nodejs/npm` team in the release proposal PR to inform them of the
-upcoming release. `npm` maintains a list of [supported versions](https://github.com/npm/cli/blob/latest/lib/utils/unsupported.js#L3)
-that will need updating to include the new major release.
+upcoming release.
 
 To keep the branch in sync until the release date, it can be as simple as
 doing the following:
@@ -1398,9 +1427,9 @@ The commits in the generated changelog must then be organized:
 * Separate all SEMVER-MAJOR, SEMVER-MINOR, and SEMVER-PATCH commits into lists
 
 ```console
-$ branch-diff upstream/vN-1.x upstream/vN.x --require-label=semver-major --group --filter-release  # get all majors
-$ branch-diff upstream/vN-1.x upstream/vN.x --require-label=semver-minor --group --filter-release  # get all minors
-$ branch-diff upstream/vN-1.x upstream/vN.x --exclude-label=semver-major,semver-minor --group --filter-release  # get all patches
+$ branch-diff upstream/vN-1.x upstream/vN.x --require-label=semver-major --group --filter-release --markdown # get all majors
+$ branch-diff upstream/vN-1.x upstream/vN.x --require-label=semver-minor --group --filter-release --markdown # get all minors
+$ branch-diff upstream/vN-1.x upstream/vN.x --exclude-label=semver-major,semver-minor --group --filter-release --markdown # get all patches
 ```
 
 #### Generate the notable changes
@@ -1468,8 +1497,9 @@ Typical resolution: sign the release again.
 [CI lockdown procedure]: https://github.com/nodejs/build/blob/HEAD/doc/jenkins-guide.md#restricting-access-for-security-releases
 [Node.js Snap management repository]: https://github.com/nodejs/snap
 [Snap]: https://snapcraft.io/node
+[`create-release-post.yml`]: https://github.com/nodejs/nodejs.org/actions/workflows/create-release-post.yml
 [`create-release-proposal`]: https://github.com/nodejs/node/actions/workflows/create-release-proposal.yml
+[`post-release.yml`]: https://github.com/nodejs/node/actions/workflows/post-release.yml
 [build-infra team]: https://github.com/orgs/nodejs/teams/build-infra
 [expected assets]: https://github.com/nodejs/build/tree/HEAD/ansible/www-standalone/tools/promote/expected_assets
-[nodejs.org release-post.js script]: https://github.com/nodejs/nodejs.org/blob/HEAD/apps/site/scripts/release-post/index.mjs
 [nodejs.org repository]: https://github.com/nodejs/nodejs.org

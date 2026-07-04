@@ -80,10 +80,11 @@ added: v0.7.7
 Allows configuration of `tty.ReadStream` so that it operates as a raw device.
 
 When in raw mode, input is always available character-by-character, not
-including modifiers. Additionally, all special processing of characters by the
-terminal is disabled, including echoing input
+including modifiers. Additionally, all special processing of input characters
+by the terminal is disabled, including echoing input
 characters. <kbd>Ctrl</kbd>+<kbd>C</kbd> will no longer cause a `SIGINT` when
-in this mode.
+in this mode. This mode does not affect terminal output processing, such as
+newline translation on Unix terminals.
 
 ## Class: `tty.WriteStream`
 
@@ -110,7 +111,7 @@ changes:
 * `fd` {number} A file descriptor associated with a TTY.
 * `options` {Object} Options passed to parent `net.Socket`,
   see `options` of [`net.Socket` constructor][].
-* Returns {tty.ReadStream}
+* Returns: {tty.ReadStream}
 
 Creates a `ReadStream` for `fd` associated with a TTY.
 
@@ -121,7 +122,7 @@ added: v0.5.8
 -->
 
 * `fd` {number} A file descriptor associated with a TTY.
-* Returns {tty.WriteStream}
+* Returns: {tty.WriteStream}
 
 Creates a `WriteStream` for `fd` associated with a TTY.
 

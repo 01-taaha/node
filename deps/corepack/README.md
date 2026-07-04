@@ -11,7 +11,7 @@ and pnpm without having to install them**.
 
 ### Default Installs
 
-Corepack is [distributed by default with all recent Node.js versions](https://nodejs.org/api/corepack.html).
+Corepack is distributed with Node.js from version 14.19.0 up to (but not including) 25.0.0.
 Run `corepack enable` to install the required Yarn and pnpm binaries on your path.
 
 ### Manual Installs
@@ -219,12 +219,12 @@ On Windows PowerShell, you can add functions using the `$PROFILE` automatic
 variable:
 
 ```powershell
-echo "function yarn { corepack yarn `$args }" >> $PROFILE
-echo "function yarnpkg { corepack yarnpkg `$args }" >> $PROFILE
-echo "function pnpm { corepack pnpm `$args }" >> $PROFILE
-echo "function pnpx { corepack pnpx `$args }" >> $PROFILE
-echo "function npm { corepack npm `$args }" >> $PROFILE
-echo "function npx { corepack npx `$args }" >> $PROFILE
+echo 'function yarn { corepack yarn @args }'    >> $PROFILE
+echo 'function yarnpkg { corepack yarnpkg @args }' >> $PROFILE
+echo 'function pnpm { corepack pnpm @args }'    >> $PROFILE
+echo 'function pnpx { corepack pnpx @args }'    >> $PROFILE
+echo 'function npm { corepack npm @args }'      >> $PROFILE
+echo 'function npx { corepack npx @args }'      >> $PROFILE
 ```
 
 ### `corepack disable [... name]`
@@ -286,8 +286,8 @@ same major line. Should you need to upgrade to a new major, use an explicit
   package manager, and to not update the Last Known Good version when it
   downloads a new version of the same major line.
 
-- `COREPACK_ENABLE_AUTO_PIN` can be set to `0` to prevent Corepack from
-  updating the `packageManager` field when it detects that the local package
+- `COREPACK_ENABLE_AUTO_PIN` can be set to `1` to instruct Corepack to
+  update the `packageManager` field when it detects that the local package
   doesn't list it. In general we recommend to always list a `packageManager`
   field (which you can easily set through `corepack use [name]@[version]`), as
   it ensures that your project installs are always deterministic.
@@ -328,8 +328,6 @@ same major line. Should you need to upgrade to a new major, use an explicit
   Only keys that start with `COREPACK_` and are not in the exception list
   (`COREPACK_ENABLE_DOWNLOAD_PROMPT` and `COREPACK_ENV_FILE` are ignored)
   will be taken into account.
-  For Node.js 18.x users, this setting has no effect as that version doesn't
-  support parsing of `.env` files.
 
 - `COREPACK_HOME` can be set in order to define where Corepack should install
   the package managers. By default it is set to `%LOCALAPPDATA%\node\corepack`
@@ -352,7 +350,7 @@ same major line. Should you need to upgrade to a new major, use an explicit
   empty password, explicitly set `COREPACK_NPM_PASSWORD` to an empty string.
 
 - `HTTP_PROXY`, `HTTPS_PROXY`, and `NO_PROXY` are supported through
-  [`proxy-from-env`](https://github.com/Rob--W/proxy-from-env).
+  [`NODE_USE_ENV_PROXY=1`](https://nodejs.org/api/cli.html#node_use_env_proxy1).
 
 - `COREPACK_INTEGRITY_KEYS` can be set to an empty string or `0` to
   instruct Corepack to skip integrity checks, or to a JSON string containing

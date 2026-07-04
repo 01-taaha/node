@@ -22,6 +22,8 @@ using ncrypto::DHPointer;
 using ncrypto::EVPKeyCtxPointer;
 using ncrypto::EVPKeyPointer;
 using v8::ArrayBuffer;
+using v8::BackingStoreInitializationMode;
+using v8::BackingStoreOnFailureMode;
 using v8::ConstructorBehavior;
 using v8::Context;
 using v8::DontDelete;
@@ -55,12 +57,33 @@ void DiffieHellman::MemoryInfo(MemoryTracker* tracker) const {
 
 namespace {
 MaybeLocal<Value> DataPointerToBuffer(Environment* env, DataPointer&& data) {
+  struct Flag {
+    bool secure;
+  };
+#ifdef V8_ENABLE_SANDBOX
+  auto backing = ArrayBuffer::NewBackingStore(
+      env->isolate(),
+      data.size(),
+      BackingStoreInitializationMode::kUninitialized,
+      BackingStoreOnFailureMode::kReturnNull);
+  if (!backing) {
+    THROW_ERR_MEMORY_ALLOCATION_FAILED(env);
+    return MaybeLocal<Value>();
+  }
+  if (data.size() > 0) {
+    memcpy(backing->Data(), data.get(), data.size());
+  }
+#else
   auto backing = ArrayBuffer::NewBackingStore(
       data.get(),
       data.size(),
-      [](void* data, size_t len, void* ptr) { DataPointer free_me(data, len); },
-      nullptr);
+      [](void* data, size_t len, void* ptr) {
+        std::unique_ptr<Flag> flag(static_cast<Flag*>(ptr));
+        DataPointer free_me(data, len, flag->secure);
+      },
+      new Flag{data.isSecure()});
   data.release();
+#endif  // V8_ENABLE_SANDBOX
 
   auto ab = ArrayBuffer::New(env->isolate(), std::move(backing));
   return Buffer::New(env, ab, 0, ab->ByteLength()).FromMaybe(Local<Value>());
@@ -173,7 +196,7 @@ void New(const FunctionCallbackInfo<Value>& args) {
 #endif
       return ThrowCryptoError(env, ERR_get_error(), "Invalid generator");
     }
-    if (bn_g.getWord() < 2) {
+    if (bn_g.getWord().has_value() && bn_g.getWord().value() < 2) {
 #ifndef OPENSSL_IS_BORINGSSL
       ERR_put_error(ERR_LIB_DH, 0, DH_R_BAD_GENERATOR, __FILE__, __LINE__);
 #else
@@ -286,17 +309,24 @@ void ComputeSecret(const FunctionCallbackInfo<Value>& args) {
   BignumPointer key(key_buf.data(), key_buf.size());
 
   switch (dh.checkPublicKey(key)) {
-    case DHPointer::CheckPublicKeyResult::INVALID:
-      // Fall-through
     case DHPointer::CheckPublicKeyResult::CHECK_FAILED:
       return THROW_ERR_CRYPTO_INVALID_KEYTYPE(env,
                                               "Unspecified validation error");
+#ifndef OPENSSL_IS_BORINGSSL
     case DHPointer::CheckPublicKeyResult::TOO_SMALL:
       return THROW_ERR_CRYPTO_INVALID_KEYLEN(env, "Supplied key is too small");
     case DHPointer::CheckPublicKeyResult::TOO_LARGE:
       return THROW_ERR_CRYPTO_INVALID_KEYLEN(env, "Supplied key is too large");
+#endif
+    case DHPointer::CheckPublicKeyResult::INVALID:
+      return THROW_ERR_CRYPTO_INVALID_KEYTYPE(env, "Supplied key is invalid");
     case DHPointer::CheckPublicKeyResult::NONE:
       break;
+  }
+
+  if (!dh.hasPrivateKey()) {
+    return THROW_ERR_CRYPTO_INVALID_STATE(
+        env, "Cannot compute shared secret without a private key");
   }
 
   auto dp = dh.computeSecret(key);
@@ -424,10 +454,9 @@ EVPKeyCtxPointer DhKeyGenTraits::Setup(DhKeyPairGenConfig* params) {
     if (!dh) return {};
 
     key_params = EVPKeyPointer::NewDH(std::move(dh));
-  } else if (std::get_if<int>(&params->params.prime)) {
+  } else if (int* prime_size = std::get_if<int>(&params->params.prime)) {
     auto param_ctx = EVPKeyCtxPointer::NewFromID(EVP_PKEY_DH);
 #ifndef OPENSSL_IS_BORINGSSL
-    int* prime_size = std::get_if<int>(&params->params.prime);
     if (!param_ctx.initForParamgen() ||
         !param_ctx.setDhParameters(*prime_size, params->params.generator)) {
       return {};
@@ -449,93 +478,21 @@ EVPKeyCtxPointer DhKeyGenTraits::Setup(DhKeyPairGenConfig* params) {
   return ctx;
 }
 
-Maybe<void> DHKeyExportTraits::AdditionalConfig(
-    const FunctionCallbackInfo<Value>& args,
-    unsigned int offset,
-    DHKeyExportConfig* params) {
-  return JustVoid();
-}
-
-WebCryptoKeyExportStatus DHKeyExportTraits::DoExport(
-    const KeyObjectData& key_data,
-    WebCryptoKeyFormat format,
-    const DHKeyExportConfig& params,
-    ByteSource* out) {
-  CHECK_NE(key_data.GetKeyType(), kKeyTypeSecret);
-
-  switch (format) {
-    case kWebCryptoKeyFormatPKCS8:
-      if (key_data.GetKeyType() != kKeyTypePrivate)
-        return WebCryptoKeyExportStatus::INVALID_KEY_TYPE;
-      return PKEY_PKCS8_Export(key_data, out);
-    case kWebCryptoKeyFormatSPKI:
-      if (key_data.GetKeyType() != kKeyTypePublic)
-        return WebCryptoKeyExportStatus::INVALID_KEY_TYPE;
-      return PKEY_SPKI_Export(key_data, out);
-    default:
-      UNREACHABLE();
-  }
-}
-
-namespace {
-ByteSource StatelessDiffieHellmanThreadsafe(const EVPKeyPointer& our_key,
-                                            const EVPKeyPointer& their_key) {
-  auto dp = DHPointer::stateless(our_key, their_key);
-  if (!dp) return {};
-
-  return ByteSource::Allocated(dp.release());
-}
-
-void Stateless(const FunctionCallbackInfo<Value>& args) {
-  Environment* env = Environment::GetCurrent(args);
-
-  CHECK(args[0]->IsObject() && args[1]->IsObject());
-  KeyObjectHandle* our_key_object;
-  ASSIGN_OR_RETURN_UNWRAP(&our_key_object, args[0].As<Object>());
-  CHECK_EQ(our_key_object->Data().GetKeyType(), kKeyTypePrivate);
-  KeyObjectHandle* their_key_object;
-  ASSIGN_OR_RETURN_UNWRAP(&their_key_object, args[1].As<Object>());
-  CHECK_NE(their_key_object->Data().GetKeyType(), kKeyTypeSecret);
-
-  const auto& our_key = our_key_object->Data().GetAsymmetricKey();
-  const auto& their_key = their_key_object->Data().GetAsymmetricKey();
-
-  Local<Value> out;
-  if (!StatelessDiffieHellmanThreadsafe(our_key, their_key)
-          .ToBuffer(env)
-              .ToLocal(&out)) return;
-
-  if (Buffer::Length(out) == 0)
-    return ThrowCryptoError(env, ERR_get_error(), "diffieHellman failed");
-
-  args.GetReturnValue().Set(out);
-}
-}  // namespace
-
 Maybe<void> DHBitsTraits::AdditionalConfig(
     CryptoJobMode mode,
     const FunctionCallbackInfo<Value>& args,
     unsigned int offset,
     DHBitsConfig* params) {
-  Environment* env = Environment::GetCurrent(args);
-
-  CHECK(args[offset]->IsObject());  // public key
-  CHECK(args[offset + 1]->IsObject());  // private key
-
-  KeyObjectHandle* private_key;
-  KeyObjectHandle* public_key;
-
-  ASSIGN_OR_RETURN_UNWRAP(&public_key, args[offset], Nothing<void>());
-  ASSIGN_OR_RETURN_UNWRAP(&private_key, args[offset + 1], Nothing<void>());
-
-  if (private_key->Data().GetKeyType() != kKeyTypePrivate ||
-      public_key->Data().GetKeyType() != kKeyTypePublic) {
-    THROW_ERR_CRYPTO_INVALID_KEYTYPE(env);
+  auto public_key = KeyObjectData::GetPublicOrPrivateKeyFromJs(args, &offset);
+  if (!public_key) [[unlikely]]
     return Nothing<void>();
-  }
 
-  params->public_key = public_key->Data().addRef();
-  params->private_key = private_key->Data().addRef();
+  auto private_key = KeyObjectData::GetPrivateKeyFromJs(args, &offset, true);
+  if (!private_key) [[unlikely]]
+    return Nothing<void>();
+
+  params->public_key = std::move(public_key);
+  params->private_key = std::move(private_key);
 
   return JustVoid();
 }
@@ -546,12 +503,19 @@ MaybeLocal<Value> DHBitsTraits::EncodeOutput(Environment* env,
   return out->ToArrayBuffer(env);
 }
 
-bool DHBitsTraits::DeriveBits(
-    Environment* env,
-    const DHBitsConfig& params,
-    ByteSource* out) {
-  *out = StatelessDiffieHellmanThreadsafe(params.private_key.GetAsymmetricKey(),
-                                          params.public_key.GetAsymmetricKey());
+bool DHBitsTraits::DeriveBits(Environment* env,
+                              const DHBitsConfig& params,
+                              ByteSource* out,
+                              CryptoJobMode mode,
+                              CryptoErrorStore* errors) {
+  auto dp = DHPointer::stateless(params.private_key.GetAsymmetricKey(),
+                                 params.public_key.GetAsymmetricKey());
+  if (!dp) {
+    return false;
+  }
+
+  *out = ByteSource::Allocated(dp.release());
+  CHECK(!out->empty());
   return true;
 }
 
@@ -604,9 +568,7 @@ void DiffieHellman::Initialize(Environment* env, Local<Object> target) {
   make(FIXED_ONE_BYTE_STRING(env->isolate(), "DiffieHellmanGroup"),
        DiffieHellmanGroup);
 
-  SetMethodNoSideEffect(context, target, "statelessDH", Stateless);
   DHKeyPairGenJob::Initialize(env, target);
-  DHKeyExportJob::Initialize(env, target);
   DHBitsJob::Initialize(env, target);
 }
 
@@ -625,10 +587,8 @@ void DiffieHellman::RegisterExternalReferences(
   registry->Register(SetPrivateKey);
 
   registry->Register(Check);
-  registry->Register(Stateless);
 
   DHKeyPairGenJob::RegisterExternalReferences(registry);
-  DHKeyExportJob::RegisterExternalReferences(registry);
   DHBitsJob::RegisterExternalReferences(registry);
 }
 

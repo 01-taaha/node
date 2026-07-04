@@ -7,7 +7,10 @@ const {
   RequestContentLengthMismatchError,
   RequestAbortedError,
   SocketError,
-  InformationalError
+  InformationalError,
+  InvalidArgumentError,
+  HeadersTimeoutError,
+  BodyTimeoutError
 } = require('../core/errors.js')
 const {
   kUrl,
@@ -23,16 +26,31 @@ const {
   kStrictContentLength,
   kOnError,
   kMaxConcurrentStreams,
+  kPingInterval,
   kHTTP2Session,
+  kHTTP2InitialWindowSize,
+  kHTTP2ConnectionWindowSize,
+  kHostAuthority,
   kResume,
   kSize,
   kHTTPContext,
   kClosed,
-  kBodyTimeout
+  kKeepAliveDefaultTimeout,
+  kHeadersTimeout,
+  kBodyTimeout,
+  kEnableConnectProtocol,
+  kRemoteSettings,
+  kHTTP2Stream,
+  kHTTP2SessionState
 } = require('../core/symbols.js')
 const { channels } = require('../core/diagnostics.js')
 
 const kOpenStreams = Symbol('open streams')
+const kRequestStreamId = Symbol('request stream id')
+const kRequestStream = Symbol('request stream')
+const kRequestStreamCleanup = Symbol('request stream cleanup')
+const kRequestStreamState = Symbol('request stream state')
+const kReceivedGoAway = Symbol('received goaway')
 
 let extractBody
 
@@ -53,52 +71,168 @@ const {
     HTTP2_HEADER_SCHEME,
     HTTP2_HEADER_CONTENT_LENGTH,
     HTTP2_HEADER_EXPECT,
-    HTTP2_HEADER_STATUS
+    HTTP2_HEADER_STATUS,
+    HTTP2_HEADER_PROTOCOL,
+    NGHTTP2_NO_ERROR,
+    NGHTTP2_REFUSED_STREAM
   }
 } = http2
 
-function parseH2Headers (headers) {
-  const result = []
+function getGoAwayError (session, errorCode) {
+  return session[kError] ||
+    (errorCode === NGHTTP2_NO_ERROR
+      ? new InformationalError(`HTTP/2: "GOAWAY" frame received with code ${errorCode}`)
+      : new SocketError(`HTTP/2: "GOAWAY" frame received with code ${errorCode}`, util.getSocketInfo(session[kSocket])))
+}
 
-  for (const [name, value] of Object.entries(headers)) {
-    // h2 may concat the header value by array
-    // e.g. Set-Cookie
-    if (Array.isArray(value)) {
-      for (const subvalue of value) {
-        // we need to provide each header value of header name
-        // because the headers handler expect name-value pair
-        result.push(Buffer.from(name), Buffer.from(subvalue))
-      }
-    } else {
-      result.push(Buffer.from(name), Buffer.from(value))
+function resetHttp2Session (session, err) {
+  const client = session[kClient]
+  const socket = session[kSocket]
+
+  if (client[kHTTP2Session] === session) {
+    client[kSocket] = null
+    client[kHTTPContext] = null
+    client[kHTTP2Session] = null
+  }
+
+  if (socket != null && socket[kError] == null) {
+    socket[kError] = err
+  }
+
+  if (!session.closed && !session.destroyed) {
+    try {
+      session.destroy(err)
+    } catch {}
+  }
+
+  util.destroy(socket, err)
+}
+
+function getGoAwayPendingIdx (client, lastStreamID) {
+  const maxAcceptedStreamID = Number.isInteger(lastStreamID) ? lastStreamID : Number.MAX_SAFE_INTEGER
+
+  for (let i = client[kRunningIdx]; i < client[kPendingIdx]; i++) {
+    const request = client[kQueue][i]
+
+    if (request == null) {
+      continue
+    }
+
+    if (typeof request[kRequestStreamId] !== 'number' || request[kRequestStreamId] > maxAcceptedStreamID) {
+      return i
     }
   }
 
-  return result
+  return client[kPendingIdx]
 }
 
-async function connectH2 (client, socket) {
+function detachRequestFromStream (request) {
+  request[kRequestStreamId] = null
+  request[kRequestStream] = null
+  request[kRequestStreamCleanup] = null
+}
+
+function bindRequestToStream (request, stream, cleanup) {
+  const previousCleanup = request[kRequestStreamCleanup]
+  const previousStream = request[kRequestStream]
+  detachRequestFromStream(request)
+  previousCleanup?.(previousStream)
+  request[kRequestStreamId] = stream.id
+  request[kRequestStream] = stream
+  request[kRequestStreamCleanup] = cleanup
+}
+
+function clearRequestStream (request) {
+  const cleanup = request[kRequestStreamCleanup]
+  const stream = request[kRequestStream]
+  detachRequestFromStream(request)
+  cleanup?.(stream)
+}
+
+function requeueUnsentRequest (client, request) {
+  client[kQueue].splice(client[kPendingIdx] + 1, 0, request)
+}
+
+function completeRequest (client, request, resetPendingIdx = false) {
+  const index = client[kQueue].indexOf(request, client[kRunningIdx])
+
+  if (index === -1 || index >= client[kPendingIdx]) {
+    return
+  }
+
+  client[kQueue].splice(index, 1)
+  client[kPendingIdx]--
+
+  if (resetPendingIdx && client[kPendingIdx] < client[kRunningIdx]) {
+    client[kPendingIdx] = client[kRunningIdx]
+  }
+}
+
+function canRetryRequestAfterGoAway (request) {
+  const { body } = request
+
+  return body == null || util.isBuffer(body) || util.isBlobLike(body)
+}
+
+function closeRequestStream (request, code = NGHTTP2_REFUSED_STREAM) {
+  const stream = request[kRequestStream]
+
+  clearRequestStream(request)
+
+  if (stream != null && !stream.destroyed && !stream.closed) {
+    try {
+      stream.close(code)
+    } catch {}
+  }
+}
+
+function connectH2 (client, socket) {
   client[kSocket] = socket
+
+  const http2InitialWindowSize = client[kHTTP2InitialWindowSize]
+  const http2ConnectionWindowSize = client[kHTTP2ConnectionWindowSize]
 
   const session = http2.connect(client[kUrl], {
     createConnection: () => socket,
     peerMaxConcurrentStreams: client[kMaxConcurrentStreams],
     settings: {
       // TODO(metcoder95): add support for PUSH
-      enablePush: false
+      enablePush: false,
+      ...(http2InitialWindowSize != null ? { initialWindowSize: http2InitialWindowSize } : null)
     }
   })
 
+  client[kSocket] = socket
   session[kOpenStreams] = 0
   session[kClient] = client
   session[kSocket] = socket
-  session[kHTTP2Session] = null
+  session[kHTTP2SessionState] = {
+    idleTimeout: null,
+    ping: {
+      interval: client[kPingInterval] === 0 ? null : setInterval(onHttp2SendPing, client[kPingInterval], session).unref()
+    }
+  }
+  session[kReceivedGoAway] = false
+  // We set it to true by default in a best-effort; however once connected to an H2 server
+  // we will check if extended CONNECT protocol is supported or not
+  // and set this value accordingly.
+  session[kEnableConnectProtocol] = false
+  // States whether or not we have received the remote settings from the server
+  session[kRemoteSettings] = false
+
+  // Apply connection-level flow control once connected (if supported).
+  if (http2ConnectionWindowSize) {
+    util.addListener(session, 'connect', applyConnectionWindowSize.bind(session, http2ConnectionWindowSize))
+  }
 
   util.addListener(session, 'error', onHttp2SessionError)
   util.addListener(session, 'frameError', onHttp2FrameError)
   util.addListener(session, 'end', onHttp2SessionEnd)
   util.addListener(session, 'goaway', onHttp2SessionGoAway)
   util.addListener(session, 'close', onHttp2SessionClose)
+  util.addListener(session, 'remoteSettings', onHttp2RemoteSettings)
+  // TODO (@metcoder95): implement SETTINGS support
+  // util.addListener(session, 'localSettings', onHttp2RemoteSettings)
 
   session.unref()
 
@@ -115,12 +249,23 @@ async function connectH2 (client, socket) {
   return {
     version: 'h2',
     defaultPipelining: Infinity,
+    /**
+     * @param {import('../core/request.js')} request
+     * @returns {boolean}
+    */
     write (request) {
       return writeH2(client, request)
     },
+    /**
+     * @returns {void}
+     */
     resume () {
       resumeH2(client)
     },
+    /**
+     * @param {Error | null} err
+     * @param {() => void} callback
+     */
     destroy (err, callback) {
       if (socket[kClosed]) {
         queueMicrotask(callback)
@@ -128,10 +273,51 @@ async function connectH2 (client, socket) {
         socket.destroy(err).on('close', callback)
       }
     },
+    /**
+     * @type {boolean}
+     */
     get destroyed () {
       return socket.destroyed
     },
-    busy () {
+    /**
+     * @param {import('../core/request.js')} request
+     * @returns {boolean}
+    */
+    busy (request) {
+      if (session[kRemoteSettings] === false && client[kRunning] > 0) {
+        return true
+      }
+
+      if (client[kRunning] >= client[kMaxConcurrentStreams]) {
+        return true
+      }
+
+      if (request != null) {
+        if (client[kRunning] > 0) {
+          // We are already processing requests
+
+          // Unlike HTTP/1.1 pipelining, HTTP/2 multiplexes requests on
+          // independent streams, so non-idempotent requests can be dispatched
+          // concurrently. Retry eligibility is handled by stream/session error
+          // handling instead of by serializing all non-idempotent requests.
+          // Don't dispatch an upgrade until all preceding requests have completed.
+          // Possibly, we do not have remote settings confirmed yet.
+          if ((request.upgrade === 'websocket' || request.method === 'CONNECT') && session[kRemoteSettings] === false) return true
+          // Request with stream or iterator body can error while other requests
+          // are inflight and indirectly error those as well.
+          // Ensure this doesn't happen by waiting for inflight
+          // to complete before dispatching.
+
+          // Request with stream or iterator body cannot be retried.
+          // Ensure that no other requests are inflight and
+          // could cause failure.
+          if (util.bodyLength(request.body) !== 0 &&
+            (util.isStream(request.body) || util.isAsyncIterable(request.body) || util.isFormDataLike(request.body))) return true
+        } else {
+          return (request.upgrade === 'websocket' || request.method === 'CONNECT') && session[kRemoteSettings] === false
+        }
+      }
+
       return false
     }
   }
@@ -139,14 +325,120 @@ async function connectH2 (client, socket) {
 
 function resumeH2 (client) {
   const socket = client[kSocket]
+  const session = client[kHTTP2Session]
 
   if (socket?.destroyed === false) {
     if (client[kSize] === 0 || client[kMaxConcurrentStreams] === 0) {
       socket.unref()
-      client[kHTTP2Session].unref()
+      session.unref()
     } else {
       socket.ref()
-      client[kHTTP2Session].ref()
+      session.ref()
+    }
+
+    if (client[kSize] === 0 && session[kOpenStreams] === 0) {
+      setHttp2IdleTimeout(session)
+    } else {
+      clearHttp2IdleTimeout(session)
+    }
+  }
+}
+
+function clearHttp2IdleTimeout (session) {
+  const state = session[kHTTP2SessionState]
+
+  if (state?.idleTimeout != null) {
+    clearTimeout(state.idleTimeout)
+    state.idleTimeout = null
+  }
+}
+
+function setHttp2IdleTimeout (session) {
+  const client = session[kClient]
+
+  if (client[kHTTP2Session] !== session || session.closed || session.destroyed) {
+    return
+  }
+
+  if (session[kOpenStreams] !== 0 || client[kSize] !== 0) {
+    clearHttp2IdleTimeout(session)
+    return
+  }
+
+  const state = session[kHTTP2SessionState]
+  if (state.idleTimeout == null) {
+    state.idleTimeout = setTimeout(onHttp2SessionIdleTimeout, client[kKeepAliveDefaultTimeout], session).unref()
+  }
+}
+
+function onHttp2SessionIdleTimeout (session) {
+  const client = session[kClient]
+  const socket = session[kSocket]
+  const state = session[kHTTP2SessionState]
+
+  state.idleTimeout = null
+
+  if (client[kHTTP2Session] !== session || session[kOpenStreams] !== 0 || client[kSize] !== 0 || session.closed || session.destroyed) {
+    return
+  }
+
+  const err = new InformationalError('socket idle timeout')
+  socket[kError] = err
+  util.destroy(socket, err)
+}
+
+function applyConnectionWindowSize (connectionWindowSize) {
+  try {
+    if (typeof this.setLocalWindowSize === 'function') {
+      this.setLocalWindowSize(connectionWindowSize)
+    }
+  } catch {
+    // Best-effort only.
+  }
+}
+
+function onHttp2RemoteSettings (settings) {
+  // Fallbacks are a safe bet, remote setting will always override
+  this[kClient][kMaxConcurrentStreams] = settings.maxConcurrentStreams ?? this[kClient][kMaxConcurrentStreams]
+  /**
+   * From RFC-8441
+   * A sender MUST NOT send a SETTINGS_ENABLE_CONNECT_PROTOCOL parameter
+   * with the value of 0 after previously sending a value of 1.
+   */
+  // Note: Cannot be tested in Node, it does not supports disabling the extended CONNECT protocol once enabled
+  if (this[kRemoteSettings] === true && this[kEnableConnectProtocol] === true && settings.enableConnectProtocol === false) {
+    const err = new InformationalError('HTTP/2: Server disabled extended CONNECT protocol against RFC-8441')
+    this[kSocket][kError] = err
+    this[kClient][kOnError](err)
+    return
+  }
+
+  this[kEnableConnectProtocol] = settings.enableConnectProtocol ?? this[kEnableConnectProtocol]
+  this[kRemoteSettings] = true
+  this[kClient][kResume]()
+}
+
+function onHttp2SendPing (session) {
+  const state = session[kHTTP2SessionState]
+  if ((session.closed || session.destroyed) && state.ping.interval != null) {
+    clearInterval(state.ping.interval)
+    state.ping.interval = null
+    return
+  }
+
+  // If no ping sent, do nothing
+  session.ping(onPing.bind(session))
+
+  function onPing (err, duration) {
+    const client = this[kClient]
+    const socket = this[kSocket]
+
+    if (err != null) {
+      const error = new InformationalError(`HTTP/2: "PING" errored - type ${err.message}`)
+      socket[kError] = error
+      client[kOnError](error)
+    } else {
+      client.emit('ping', duration)
     }
   }
 }
@@ -179,33 +471,54 @@ function onHttp2SessionEnd () {
  *
  * @this {import('http2').ClientHttp2Session}
  * @param {number} errorCode
+ * @param {number} lastStreamID
  */
-function onHttp2SessionGoAway (errorCode) {
-  // TODO(mcollina): Verify if GOAWAY implements the spec correctly:
-  // https://datatracker.ietf.org/doc/html/rfc7540#section-6.8
-  // Specifically, we do not verify the "valid" stream id.
-
-  const err = this[kError] || new SocketError(`HTTP/2: "GOAWAY" frame received with code ${errorCode}`, util.getSocketInfo(this[kSocket]))
-  const client = this[kClient]
-
-  client[kSocket] = null
-  client[kHTTPContext] = null
-
-  // this is an HTTP2 session
-  this.close()
-  this[kHTTP2Session] = null
-
-  util.destroy(this[kSocket], err)
-
-  // Fail head of pipeline.
-  if (client[kRunningIdx] < client[kQueue].length) {
-    const request = client[kQueue][client[kRunningIdx]]
-    client[kQueue][client[kRunningIdx]++] = null
-    util.errorRequest(client, request, err)
-    client[kPendingIdx] = client[kRunningIdx]
+function onHttp2SessionGoAway (errorCode, lastStreamID) {
+  if (this[kReceivedGoAway]) {
+    return
   }
 
-  assert(client[kRunning] === 0)
+  this[kReceivedGoAway] = true
+
+  const err = getGoAwayError(this, errorCode)
+  const client = this[kClient]
+  const previousPendingIdx = client[kPendingIdx]
+  const pendingIdx = getGoAwayPendingIdx(client, lastStreamID)
+  const retriableRequests = []
+
+  for (let i = pendingIdx; i < previousPendingIdx; i++) {
+    const request = client[kQueue][i]
+
+    if (request != null) {
+      closeRequestStream(request)
+
+      if (canRetryRequestAfterGoAway(request)) {
+        retriableRequests.push(request)
+      } else {
+        util.errorRequest(client, request, err)
+      }
+    }
+  }
+
+  if (pendingIdx !== previousPendingIdx) {
+    const remainingPendingRequests = client[kQueue].slice(previousPendingIdx)
+    client[kQueue].length = pendingIdx
+    client[kQueue].push(...retriableRequests, ...remainingPendingRequests)
+  }
+
+  if (client[kHTTP2Session] === this) {
+    client[kSocket] = null
+    client[kHTTPContext] = null
+    client[kHTTP2Session] = null
+  }
+
+  clearHttp2IdleTimeout(this)
+
+  if (!this.closed && !this.destroyed) {
+    this.close()
+  }
+
+  client[kPendingIdx] = pendingIdx
 
   client.emit('disconnect', client[kUrl], [client], err)
 
@@ -213,13 +526,22 @@ function onHttp2SessionGoAway (errorCode) {
 }
 
 function onHttp2SessionClose () {
-  const { [kClient]: client } = this
-  const { [kSocket]: socket } = client
+  const { [kClient]: client, [kHTTP2SessionState]: state, [kSocket]: socket } = this
 
-  const err = this[kSocket][kError] || this[kError] || new SocketError('closed', util.getSocketInfo(socket))
+  const err = socket[kError] || this[kError] || new SocketError('closed', util.getSocketInfo(socket))
 
-  client[kSocket] = null
-  client[kHTTPContext] = null
+  if (client[kHTTP2Session] === this) {
+    client[kSocket] = null
+    client[kHTTPContext] = null
+    client[kHTTP2Session] = null
+  }
+
+  clearHttp2IdleTimeout(this)
+
+  if (state.ping.interval != null) {
+    clearInterval(state.ping.interval)
+    state.ping.interval = null
+  }
 
   if (client.destroyed) {
     assert(client[kPending] === 0)
@@ -228,7 +550,9 @@ function onHttp2SessionClose () {
     const requests = client[kQueue].splice(client[kRunningIdx])
     for (let i = 0; i < requests.length; i++) {
       const request = requests[i]
-      util.errorRequest(client, request, err)
+      if (request != null) {
+        util.errorRequest(client, request, err)
+      }
     }
   }
 }
@@ -236,14 +560,26 @@ function onHttp2SessionClose () {
 function onHttp2SocketClose () {
   const err = this[kError] || new SocketError('closed', util.getSocketInfo(this))
 
-  const client = this[kHTTP2Session][kClient]
+  const session = this[kHTTP2Session]
+  const client = session[kClient]
+
+  if (client[kSocket] !== this) {
+    // Ignore stale socket closes from a detached GOAWAY session and from any
+    // session that has already been replaced. If the session was detached
+    // without a GOAWAY and there is no replacement yet, we still need the
+    // close event to flush the client state.
+    if (session[kReceivedGoAway] || (client[kHTTP2Session] != null && client[kHTTP2Session] !== session)) {
+      return
+    }
+  }
 
   client[kSocket] = null
   client[kHTTPContext] = null
-
-  if (this[kHTTP2Session] !== null) {
-    this[kHTTP2Session].destroy(err)
+  if (client[kHTTP2Session] === session) {
+    client[kHTTP2Session] = null
   }
+
+  session.destroy(err)
 
   client[kPendingIdx] = client[kRunningIdx]
 
@@ -270,49 +606,223 @@ function onSocketClose () {
   this[kClosed] = true
 }
 
+function noop () {}
+
+function closeStreamSession (stream) {
+  const session = stream[kHTTP2Session]
+
+  stream[kHTTP2Session] = null
+  session[kOpenStreams] -= 1
+  if (session[kOpenStreams] === 0) {
+    session.unref()
+    setHttp2IdleTimeout(session)
+  }
+}
+
+function onUpgradeStreamClose () {
+  this.off('error', noop)
+
+  const state = this[kRequestStreamState]
+  this[kRequestStreamState] = null
+
+  failUpgradeStream(state, new InformationalError('HTTP/2: stream closed before response headers'))
+  closeStreamSession(this)
+}
+
+function onRequestStreamClose () {
+  const state = this[kRequestStreamState]
+
+  if (state) {
+    // Release the stream first so request references are cleared,
+    // then complete the response with trailers if available.
+    releaseRequestStream(this)
+
+    if (state.pendingEnd && !state.request.aborted && !state.request.completed) {
+      state.request.onResponseEnd(state.trailers || {})
+      state.finalizeRequest()
+    }
+  }
+
+  this.off('data', onData)
+  this.off('error', noop)
+  closeStreamSession(this)
+  this[kRequestStreamState] = null
+}
+
 // https://www.rfc-editor.org/rfc/rfc7230#section-3.3.2
 function shouldSendContentLength (method) {
   return method !== 'GET' && method !== 'HEAD' && method !== 'OPTIONS' && method !== 'TRACE' && method !== 'CONNECT'
 }
 
-function writeH2 (client, request) {
-  const requestTimeout = request.bodyTimeout ?? client[kBodyTimeout]
-  const session = client[kHTTP2Session]
-  const { method, path, host, upgrade, expectContinue, signal, headers: reqHeaders } = request
-  let { body } = request
-
-  if (upgrade) {
-    util.errorRequest(client, request, new Error('Upgrade not supported for H2'))
-    return false
-  }
-
+function buildRequestHeaders (reqHeaders) {
   const headers = {}
+
   for (let n = 0; n < reqHeaders.length; n += 2) {
     const key = reqHeaders[n + 0]
     const val = reqHeaders[n + 1]
+    const current = headers[key]
 
-    if (Array.isArray(val)) {
-      for (let i = 0; i < val.length; i++) {
-        if (headers[key]) {
-          headers[key] += `,${val[i]}`
-        } else {
-          headers[key] = val[i]
-        }
+    if (key === 'cookie') {
+      if (current != null) {
+        headers[key] = Array.isArray(current) ? (current.push(val), current) : [current, val]
+      } else {
+        headers[key] = val
       }
-    } else {
-      headers[key] = val
+
+      continue
+    }
+
+    if (typeof val === 'string') {
+      headers[key] = current ? `${current}, ${val}` : val
+      continue
+    }
+
+    for (let i = 0; i < val.length; i++) {
+      headers[key] = headers[key] ? `${headers[key]}, ${val[i]}` : val[i]
     }
   }
+
+  return headers
+}
+
+function removeUpgradeStreamListeners (stream) {
+  stream.off('response', onUpgradeResponse)
+  stream.off('error', onUpgradeStreamError)
+  stream.off('end', onUpgradeStreamEnd)
+  stream.off('timeout', onUpgradeStreamTimeout)
+  stream.off('error', noop)
+}
+
+function releaseUpgradeStream (stream) {
+  if (stream == null) {
+    return
+  }
+
+  const state = stream[kRequestStreamState]
+  if (state == null) {
+    return
+  }
+
+  const { request } = state
+
+  if (request[kRequestStream] === stream) {
+    detachRequestFromStream(request)
+  }
+
+  removeUpgradeStreamListeners(stream)
+
+  if (!stream.destroyed && !stream.closed) {
+    stream.once('error', noop)
+  }
+}
+
+function failUpgradeStream (state, err) {
+  if (state == null) {
+    return
+  }
+
+  const { request } = state
+  if (state.responseReceived || request.aborted || request.completed) {
+    return
+  }
+
+  releaseUpgradeStream(state.stream)
+  state.abort(err, true)
+}
+
+function onUpgradeStreamError () {
+  const state = this[kRequestStreamState]
+
+  if (typeof this.rstCode === 'number' && this.rstCode !== 0) {
+    failUpgradeStream(state, new InformationalError(`HTTP/2: "stream error" received - code ${this.rstCode}`))
+  } else {
+    failUpgradeStream(state, new InformationalError('HTTP/2: stream errored before response headers'))
+  }
+}
+
+function onUpgradeStreamEnd () {
+  failUpgradeStream(this[kRequestStreamState], new InformationalError('HTTP/2: stream half-closed (remote)'))
+}
+
+function onUpgradeStreamTimeout () {
+  const state = this[kRequestStreamState]
+  failUpgradeStream(state, new InformationalError(`HTTP/2: "stream timeout after ${state.headersTimeout}"`))
+}
+
+function onUpgradeResponse (headers, _flags) {
+  const stream = this
+  const state = stream[kRequestStreamState]
+  const { request } = state
+
+  state.responseReceived = true
+
+  const statusCode = headers[HTTP2_HEADER_STATUS]
+  delete headers[HTTP2_HEADER_STATUS]
+
+  request.onRequestUpgrade(statusCode, headers, stream)
+
+  if (request.aborted || request.completed) {
+    return
+  }
+
+  removeUpgradeStreamListeners(stream)
+  detachRequestFromStream(request)
+  state.finalizeRequest()
+}
+
+function setupUpgradeStream (stream, state) {
+  const { request, headersTimeout, session } = state
+
+  stream[kHTTP2Stream] = true
+  stream[kHTTP2Session] = session
+  stream[kRequestStreamState] = state
+  state.stream = stream
+
+  bindRequestToStream(request, stream, releaseUpgradeStream)
+  stream.once('response', onUpgradeResponse)
+  stream.on('error', onUpgradeStreamError)
+  stream.once('end', onUpgradeStreamEnd)
+  stream.on('timeout', onUpgradeStreamTimeout)
+  stream.once('close', onUpgradeStreamClose)
+
+  clearHttp2IdleTimeout(session)
+  ++session[kOpenStreams]
+  stream.setTimeout(headersTimeout)
+}
+
+function writeH2 (client, request) {
+  const headersTimeout = request.headersTimeout ?? client[kHeadersTimeout]
+  const bodyTimeout = request.bodyTimeout ?? client[kBodyTimeout]
+  const session = client[kHTTP2Session]
+  const { method, path, host, upgrade, expectContinue, signal, protocol, headers: reqHeaders } = request
+  let { body } = request
+
+  if (upgrade != null && upgrade !== 'websocket') {
+    util.errorRequest(client, request, new InvalidArgumentError(`Custom upgrade "${upgrade}" not supported over HTTP/2`))
+    return false
+  }
+
+  const headers = buildRequestHeaders(reqHeaders)
 
   /** @type {import('node:http2').ClientHttp2Stream} */
   let stream = null
 
-  const { hostname, port } = client[kUrl]
-
-  headers[HTTP2_HEADER_AUTHORITY] = host || `${hostname}${port ? `:${port}` : ''}`
+  headers[HTTP2_HEADER_AUTHORITY] = host || client[kHostAuthority]
   headers[HTTP2_HEADER_METHOD] = method
 
-  const abort = (err) => {
+  let requestFinalized = false
+  const finalizeRequest = (resetPendingIdx = false) => {
+    if (requestFinalized) {
+      return
+    }
+
+    requestFinalized = true
+    completeRequest(client, request, resetPendingIdx)
+
+    client[kResume]()
+  }
+
+  const abort = (err, resetPendingIdx = false) => {
     if (request.aborted || request.completed) {
       return
     }
@@ -322,16 +832,14 @@ function writeH2 (client, request) {
     util.errorRequest(client, request, err)
 
     if (stream != null) {
-      // Some chunks might still come after abort,
-      // let's ignore them
-      stream.removeAllListeners('data')
+      clearRequestStream(request)
 
       // On Abort, we close the stream to send RST_STREAM frame
       stream.close()
 
       // We move the running index to the next request
       client[kOnError](err)
-      client[kResume]()
+      finalizeRequest(resetPendingIdx)
     }
 
     // We do not destroy the socket as we can continue using the session
@@ -339,10 +847,36 @@ function writeH2 (client, request) {
     util.destroy(body, err)
   }
 
+  const requestStream = (headers, options) => {
+    try {
+      return session.request(headers, options)
+    } catch (err) {
+      if (err?.code === 'ERR_HTTP2_INVALID_SESSION') {
+        const wrappedErr = new SocketError(err.message, util.getSocketInfo(session[kSocket]))
+        wrappedErr.cause = err
+        session[kError] = wrappedErr
+        resetHttp2Session(session, wrappedErr)
+        requeueUnsentRequest(client, request)
+
+        return null
+      }
+
+      const wrappedErr = new InformationalError(err.message, { cause: err })
+      session[kError] = wrappedErr
+      session[kSocket][kError] = wrappedErr
+
+      session.destroy(wrappedErr)
+      util.destroy(session[kSocket], wrappedErr)
+      abort(wrappedErr)
+
+      return null
+    }
+  }
+
   try {
     // We are already connected, streams are pending.
     // We can call on connect, and wait for abort
-    request.onConnect(abort)
+    request.onRequestStart(abort, null)
   } catch (err) {
     util.errorRequest(client, request, err)
   }
@@ -351,40 +885,70 @@ function writeH2 (client, request) {
     return false
   }
 
-  if (method === 'CONNECT') {
+  if (upgrade || method === 'CONNECT') {
     session.ref()
-    // We are already connected, streams are pending, first request
+
+    const upgradeState = {
+      abort,
+      finalizeRequest,
+      request,
+      headersTimeout,
+      bodyTimeout,
+      responseReceived: false,
+      session,
+      stream: null
+    }
+
+    if (upgrade === 'websocket') {
+      // We cannot upgrade to websocket if extended CONNECT protocol is not supported
+      if (session[kEnableConnectProtocol] === false) {
+        util.errorRequest(client, request, new InformationalError('HTTP/2: Extended CONNECT protocol not supported by server'))
+        session.unref()
+        return false
+      }
+
+      // We force the method to CONNECT
+      // as per RFC-8441
+      // https://datatracker.ietf.org/doc/html/rfc8441#section-4
+      headers[HTTP2_HEADER_METHOD] = 'CONNECT'
+      headers[HTTP2_HEADER_PROTOCOL] = 'websocket'
+      // :path and :scheme headers must be omitted when sending CONNECT but set if extended-CONNECT
+      headers[HTTP2_HEADER_PATH] = path
+
+      if (protocol === 'ws:' || protocol === 'wss:') {
+        headers[HTTP2_HEADER_SCHEME] = protocol === 'ws:' ? 'http' : 'https'
+      } else {
+        headers[HTTP2_HEADER_SCHEME] = protocol === 'http:' ? 'http' : 'https'
+      }
+
+      stream = requestStream(headers, { endStream: false, signal })
+      if (stream == null) {
+        session.unref()
+        return false
+      }
+      setupUpgradeStream(stream, upgradeState)
+      return true
+    }
+
+    // TODO: consolidate once we support CONNECT properly
+    // NOTE: We are already connected, streams are pending, first request
     // will create a new stream. We trigger a request to create the stream and wait until
     // `ready` event is triggered
     // We disabled endStream to allow the user to write to the stream
-    stream = session.request(headers, { endStream: false, signal })
-
-    if (!stream.pending) {
-      request.onUpgrade(null, null, stream)
-      ++session[kOpenStreams]
-      client[kQueue][client[kRunningIdx]++] = null
-    } else {
-      stream.once('ready', () => {
-        request.onUpgrade(null, null, stream)
-        ++session[kOpenStreams]
-        client[kQueue][client[kRunningIdx]++] = null
-      })
+    stream = requestStream(headers, { endStream: false, signal })
+    if (stream == null) {
+      session.unref()
+      return false
     }
-
-    stream.once('close', () => {
-      session[kOpenStreams] -= 1
-      if (session[kOpenStreams] === 0) session.unref()
-    })
-    stream.setTimeout(requestTimeout)
+    setupUpgradeStream(stream, upgradeState)
 
     return true
   }
 
   // https://tools.ietf.org/html/rfc7540#section-8.3
   // :path and :scheme headers must be omitted when sending CONNECT
-
   headers[HTTP2_HEADER_PATH] = path
-  headers[HTTP2_HEADER_SCHEME] = 'https'
+  headers[HTTP2_HEADER_SCHEME] = protocol === 'http:' ? 'http' : 'https'
 
   // https://tools.ietf.org/html/rfc7231#section-4.3.1
   // https://tools.ietf.org/html/rfc7231#section-4.3.2
@@ -398,7 +962,10 @@ function writeH2 (client, request) {
   const expectsPayload = (
     method === 'PUT' ||
     method === 'POST' ||
-    method === 'PATCH'
+    method === 'PATCH' ||
+    method === 'QUERY' ||
+    method === 'PROPFIND' ||
+    method === 'PROPPATCH'
   )
 
   if (body && typeof body.read === 'function') {
@@ -422,12 +989,12 @@ function writeH2 (client, request) {
     contentLength = request.contentLength
   }
 
-  if (contentLength === 0 || !expectsPayload) {
+  if (contentLength === 0 && !expectsPayload) {
     // https://tools.ietf.org/html/rfc7230#section-3.3.2
     // A user agent SHOULD NOT send a Content-Length header field when
     // the request message does not contain a payload body and the method
     // semantics do not anticipate such a body.
-
+    // And for methods that don't expect a payload, omit Content-Length.
     contentLength = null
   }
 
@@ -443,7 +1010,7 @@ function writeH2 (client, request) {
   }
 
   if (contentLength != null) {
-    assert(body, 'no body must not have content length')
+    assert(body || contentLength === 0, 'no body must not have content length')
     headers[HTTP2_HEADER_CONTENT_LENGTH] = `${contentLength}`
   }
 
@@ -458,188 +1025,244 @@ function writeH2 (client, request) {
   }
 
   // TODO(metcoder95): add support for sending trailers
-  const shouldEndStream = method === 'GET' || method === 'HEAD' || body === null
-  if (expectContinue) {
-    headers[HTTP2_HEADER_EXPECT] = '100-continue'
-    stream = session.request(headers, { endStream: shouldEndStream, signal })
-
-    stream.once('continue', writeBodyH2)
-  } else {
-    stream = session.request(headers, {
-      endStream: shouldEndStream,
-      signal
-    })
-
-    writeBodyH2()
+  const shouldEndStream = body === null || contentLength === 0
+  const state = {
+    abort,
+    body,
+    client,
+    contentLength,
+    expectsPayload,
+    finalizeRequest,
+    request,
+    headersTimeout,
+    bodyTimeout,
+    responseReceived: false,
+    session,
+    stream: null
   }
 
+  if (expectContinue) {
+    headers[HTTP2_HEADER_EXPECT] = '100-continue'
+  }
+
+  stream = requestStream(headers, { endStream: shouldEndStream, signal })
+  if (stream == null) {
+    return false
+  }
+  stream[kHTTP2Stream] = true
+  stream[kRequestStreamState] = state
+  state.stream = stream
+
   // Increment counter as we have new streams open
+  clearHttp2IdleTimeout(session)
   ++session[kOpenStreams]
-  stream.setTimeout(requestTimeout)
+  stream.setTimeout(headersTimeout)
 
-  stream.once('response', headers => {
-    const { [HTTP2_HEADER_STATUS]: statusCode, ...realHeaders } = headers
-    request.onResponseStarted()
+  stream[kHTTP2Session] = session
+  stream.once('close', onRequestStreamClose)
 
-    // Due to the stream nature, it is possible we face a race condition
-    // where the stream has been assigned, but the request has been aborted
-    // the request remains in-flight and headers hasn't been received yet
-    // for those scenarios, best effort is to destroy the stream immediately
-    // as there's no value to keep it open.
-    if (request.aborted) {
-      stream.removeAllListeners('data')
-      return
-    }
+  bindRequestToStream(request, stream, releaseRequestStream)
+  if (expectContinue) {
+    stream.once('continue', writeBodyH2)
+  }
+  stream.once('response', onResponse)
+  stream.once('end', onEnd)
+  stream.once('error', onError)
+  stream.once('frameError', onFrameError)
+  stream.on('aborted', onAborted)
+  stream.on('timeout', onTimeout)
+  stream.once('trailers', onTrailers)
 
-    if (request.onHeaders(Number(statusCode), parseH2Headers(realHeaders), stream.resume.bind(stream), '') === false) {
-      stream.pause()
-    }
-  })
-
-  stream.on('data', (chunk) => {
-    if (request.onData(chunk) === false) {
-      stream.pause()
-    }
-  })
-
-  stream.once('end', (err) => {
-    stream.removeAllListeners('data')
-    // When state is null, it means we haven't consumed body and the stream still do not have
-    // a state.
-    // Present specially when using pipeline or stream
-    if (stream.state?.state == null || stream.state.state < 6) {
-      // Do not complete the request if it was aborted
-      // Not prone to happen for as safety net to avoid race conditions with 'trailers'
-      if (!request.aborted && !request.completed) {
-        request.onComplete({})
-      }
-
-      client[kQueue][client[kRunningIdx]++] = null
-      client[kResume]()
-    } else {
-      // Stream is closed or half-closed-remote (6), decrement counter and cleanup
-      // It does not have sense to continue working with the stream as we do not
-      // have yet RST_STREAM support on client-side
-      --session[kOpenStreams]
-      if (session[kOpenStreams] === 0) {
-        session.unref()
-      }
-
-      abort(err ?? new InformationalError('HTTP/2: stream half-closed (remote)'))
-      client[kQueue][client[kRunningIdx]++] = null
-      client[kPendingIdx] = client[kRunningIdx]
-      client[kResume]()
-    }
-  })
-
-  stream.once('close', () => {
-    stream.removeAllListeners('data')
-    session[kOpenStreams] -= 1
-    if (session[kOpenStreams] === 0) {
-      session.unref()
-    }
-  })
-
-  stream.once('error', function (err) {
-    stream.removeAllListeners('data')
-    abort(err)
-  })
-
-  stream.once('frameError', (type, code) => {
-    stream.removeAllListeners('data')
-    abort(new InformationalError(`HTTP/2: "frameError" received - type ${type}, code ${code}`))
-  })
-
-  stream.on('aborted', () => {
-    stream.removeAllListeners('data')
-  })
-
-  stream.on('timeout', () => {
-    const err = new InformationalError(`HTTP/2: "stream timeout after ${requestTimeout}"`)
-    stream.removeAllListeners('data')
-    session[kOpenStreams] -= 1
-
-    if (session[kOpenStreams] === 0) {
-      session.unref()
-    }
-
-    abort(err)
-  })
-
-  stream.once('trailers', trailers => {
-    if (request.aborted || request.completed) {
-      return
-    }
-
-    request.onComplete(trailers)
-  })
+  if (!expectContinue) {
+    writeBodyH2.call(stream)
+  }
 
   return true
+}
 
-  function writeBodyH2 () {
-    /* istanbul ignore else: assertion */
-    if (!body || contentLength === 0) {
-      writeBuffer(
-        abort,
-        stream,
-        null,
-        client,
-        request,
-        client[kSocket],
-        contentLength,
-        expectsPayload
-      )
-    } else if (util.isBuffer(body)) {
-      writeBuffer(
-        abort,
-        stream,
-        body,
-        client,
-        request,
-        client[kSocket],
-        contentLength,
-        expectsPayload
-      )
-    } else if (util.isBlobLike(body)) {
-      if (typeof body.stream === 'function') {
-        writeIterable(
-          abort,
-          stream,
-          body.stream(),
-          client,
-          request,
-          client[kSocket],
-          contentLength,
-          expectsPayload
-        )
-      } else {
-        writeBlob(
-          abort,
-          stream,
-          body,
-          client,
-          request,
-          client[kSocket],
-          contentLength,
-          expectsPayload
-        )
-      }
-    } else if (util.isStream(body)) {
-      writeStream(
-        abort,
-        client[kSocket],
-        expectsPayload,
-        stream,
-        body,
-        client,
-        request,
-        contentLength
-      )
-    } else if (util.isIterable(body)) {
+function removeRequestStreamListeners (stream) {
+  stream.off('error', noop)
+  stream.off('continue', writeBodyH2)
+  stream.off('response', onResponse)
+  stream.off('end', onEnd)
+  stream.off('error', onError)
+  stream.off('frameError', onFrameError)
+  stream.off('aborted', onAborted)
+  stream.off('timeout', onTimeout)
+  stream.off('trailers', onTrailers)
+  stream.off('data', onData)
+}
+
+function releaseRequestStream (stream) {
+  if (stream == null) {
+    return
+  }
+
+  const state = stream[kRequestStreamState]
+  if (state == null) {
+    return
+  }
+
+  const { request } = state
+
+  if (request[kRequestStream] === stream) {
+    detachRequestFromStream(request)
+  }
+
+  removeRequestStreamListeners(stream)
+
+  if (!stream.destroyed && !stream.closed) {
+    stream.once('error', noop)
+  }
+}
+
+function onData (chunk) {
+  const stream = this
+  const { request } = stream[kRequestStreamState]
+
+  if (request.aborted || request.completed) {
+    return
+  }
+
+  if (request.onResponseData(chunk) === false) {
+    stream.pause()
+  }
+}
+
+function onResponse (headers) {
+  const stream = this
+  const state = stream[kRequestStreamState]
+  const { request } = state
+
+  stream.off('response', onResponse)
+
+  const statusCode = headers[HTTP2_HEADER_STATUS]
+  delete headers[HTTP2_HEADER_STATUS]
+  request.onResponseStarted()
+  state.responseReceived = true
+  stream.setTimeout(state.bodyTimeout)
+
+  // Due to the stream nature, it is possible we face a race condition
+  // where the stream has been assigned, but the request has been aborted
+  // the request remains in-flight and headers hasn't been received yet
+  // for those scenarios, best effort is to destroy the stream immediately
+  // as there's no value to keep it open.
+  if (request.aborted) {
+    releaseRequestStream(stream)
+    return
+  }
+
+  if (request.onResponseStart(Number(statusCode), headers, stream.resume.bind(stream), '') === false) {
+    stream.pause()
+  }
+
+  stream.on('data', onData)
+}
+
+function onEnd () {
+  const stream = this
+  const state = stream[kRequestStreamState]
+  const { request } = state
+
+  stream.off('end', onEnd)
+
+  // If we received a response, this is a normal completion.
+  // Defer actual completion to onRequestStreamClose so that
+  // onTrailers (which may fire after 'end' on Windows) can
+  // store trailers first.
+  if (state.responseReceived) {
+    if (!request.aborted && !request.completed) {
+      state.pendingEnd = true
+    }
+  } else {
+    // Stream ended without receiving a response - this is an error
+    // (e.g., server destroyed the stream before sending headers)
+    state.abort(new InformationalError('HTTP/2: stream half-closed (remote)'), true)
+  }
+}
+
+function onError (err) {
+  const stream = this
+  const state = stream[kRequestStreamState]
+
+  stream.off('error', onError)
+  state.abort(err)
+}
+
+function onFrameError (type, code) {
+  const stream = this
+  const state = stream[kRequestStreamState]
+
+  stream.off('frameError', onFrameError)
+  state.abort(new InformationalError(`HTTP/2: "frameError" received - type ${type}, code ${code}`))
+}
+
+function onAborted () {
+  this.off('data', onData)
+}
+
+function onTimeout () {
+  const stream = this
+  const state = stream[kRequestStreamState]
+
+  // Remove self so timeout doesn't fire again after we handle it
+  stream.off('timeout', onTimeout)
+
+  const err = state.responseReceived
+    ? new BodyTimeoutError(`HTTP/2: "stream timeout after ${state.bodyTimeout}"`)
+    : new HeadersTimeoutError(`HTTP/2: "headers timeout after ${state.headersTimeout}"`)
+  state.abort(err)
+}
+
+function onTrailers (trailers) {
+  const stream = this
+  const state = stream[kRequestStreamState]
+  const { request } = state
+
+  stream.off('trailers', onTrailers)
+  stream.off('data', onData)
+
+  if (request.aborted || request.completed) {
+    return
+  }
+
+  // Store trailers for onRequestStreamClose to use when completing
+  state.trailers = trailers
+}
+
+function writeBodyH2 () {
+  const stream = this
+  const state = stream[kRequestStreamState]
+  const { abort, body, client, contentLength, expectsPayload, request } = state
+
+  if (!body || contentLength === 0) {
+    writeBuffer(
+      abort,
+      stream,
+      null,
+      client,
+      request,
+      client[kSocket],
+      contentLength,
+      expectsPayload
+    )
+  } else if (util.isBuffer(body)) {
+    writeBuffer(
+      abort,
+      stream,
+      body,
+      client,
+      request,
+      client[kSocket],
+      contentLength,
+      expectsPayload
+    )
+  } else if (util.isBlobLike(body)) {
+    if (typeof body.stream === 'function') {
       writeIterable(
         abort,
         stream,
-        body,
+        body.stream(),
         client,
         request,
         client[kSocket],
@@ -647,8 +1270,41 @@ function writeH2 (client, request) {
         expectsPayload
       )
     } else {
-      assert(false)
+      writeBlob(
+        abort,
+        stream,
+        body,
+        client,
+        request,
+        client[kSocket],
+        contentLength,
+        expectsPayload
+      )
     }
+  } else if (util.isStream(body)) {
+    writeStream(
+      abort,
+      client[kSocket],
+      expectsPayload,
+      stream,
+      body,
+      client,
+      request,
+      contentLength
+    )
+  } else if (util.isIterable(body)) {
+    writeIterable(
+      abort,
+      stream,
+      body,
+      client,
+      request,
+      client[kSocket],
+      contentLength,
+      expectsPayload
+    )
+  } else {
+    assert(false)
   }
 }
 
@@ -707,8 +1363,6 @@ function writeStream (abort, socket, expectsPayload, h2stream, body, client, req
 }
 
 async function writeBlob (abort, h2stream, body, client, request, socket, contentLength, expectsPayload) {
-  assert(contentLength === body.size, 'blob body must have content length')
-
   try {
     if (contentLength != null && contentLength !== body.size) {
       throw new RequestContentLengthMismatchError()

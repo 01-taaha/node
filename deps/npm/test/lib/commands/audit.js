@@ -906,6 +906,26 @@ t.test('audit signatures', async t => {
     t.matchSnapshot(joinedOutput())
   })
 
+  t.test('with min-release-age set verifies installed versions', async t => {
+    const { npm, joinedOutput } = await loadMockNpm(t, {
+      prefixDir: installWithValidSigs,
+      config: {
+        'min-release-age': 99999,
+      },
+    })
+    const registry = new MockRegistry({ tap: t, registry: npm.config.get('registry') })
+    await manifestWithValidSigs({ registry })
+    mockTUF({ npm, target: TUF_VALID_KEYS_TARGET })
+
+    // min-release-age flattens into a `before` cutoff that previously leaked
+    // into the exact-version manifest lookup, producing a spurious ETARGET on
+    // already-installed versions. See npm/cli#9277.
+    await npm.exec('audit', ['signatures'])
+
+    t.notOk(process.exitCode, 'should exit successfully')
+    t.match(joinedOutput(), /audited 1 package/)
+  })
+
   t.test('with valid signatures using alias', async t => {
     const { npm, joinedOutput } = await loadMockNpm(t, {
       prefixDir: installWithAlias,
@@ -940,7 +960,7 @@ t.test('audit signatures', async t => {
   })
 
   t.test('with key fallback to legacy API', async t => {
-    const { npm, joinedOutput } = await loadMockNpm(t, {
+    const { logs, npm, joinedOutput } = await loadMockNpm(t, {
       prefixDir: installWithValidSigs,
     })
     const registry = new MockRegistry({ tap: t, registry: npm.config.get('registry') })
@@ -952,6 +972,7 @@ t.test('audit signatures', async t => {
 
     t.notOk(process.exitCode, 'should exit successfully')
     t.match(joinedOutput(), /audited 1 package/)
+    t.match(logs.warn, ['Fetching verification keys using TUF failed.  Fetching directly from https://registry.npmjs.org/.'])
     t.matchSnapshot(joinedOutput())
   })
 
@@ -1849,7 +1870,138 @@ t.test('audit signatures', async t => {
 
     t.notOk(process.exitCode, 'should exit successfully')
     t.match(joinedOutput(), /1 package has a verified attestation/)
+    t.match(joinedOutput(), /use --json --include-attestations to view attestation details/)
     t.matchSnapshot(joinedOutput())
+  })
+
+  t.test('with valid attestations and --include-attestations (human-readable)', async t => {
+    const { npm, joinedOutput } = await loadMockNpm(t, {
+      prefixDir: installWithValidAttestations,
+      config: {
+        'include-attestations': true,
+      },
+      mocks: {
+        pacote: t.mock('pacote', {
+          sigstore: { verify: async () => true },
+        }),
+      },
+    })
+    const registry = new MockRegistry({ tap: t, registry: npm.config.get('registry') })
+    await manifestWithValidAttestations({ registry })
+    const fixture = fs.readFileSync(
+      path.resolve(__dirname, '../../fixtures/sigstore/valid-sigstore-attestations.json'),
+      'utf8'
+    )
+    registry.nock.get('/-/npm/v1/attestations/sigstore@1.0.0').reply(200, fixture)
+    mockTUF({ npm, target: TUF_VALID_KEYS_TARGET })
+
+    await npm.exec('audit', ['signatures'])
+
+    t.notOk(process.exitCode, 'should exit successfully')
+    t.match(joinedOutput(), /1 package has a verified attestation/)
+    t.notMatch(joinedOutput(), /use --json --include-attestations to view attestation details/)
+  })
+
+  t.test('with valid attestations --json --include-attestations', async t => {
+    const { npm, joinedOutput } = await loadMockNpm(t, {
+      prefixDir: installWithValidAttestations,
+      config: {
+        json: true,
+        'include-attestations': true,
+      },
+      mocks: {
+        pacote: t.mock('pacote', {
+          sigstore: { verify: async () => true },
+        }),
+      },
+    })
+    const registry = new MockRegistry({ tap: t, registry: npm.config.get('registry') })
+    await manifestWithValidAttestations({ registry })
+    const fixture = fs.readFileSync(
+      path.resolve(__dirname, '../../fixtures/sigstore/valid-sigstore-attestations.json'),
+      'utf8'
+    )
+    registry.nock.get('/-/npm/v1/attestations/sigstore@1.0.0').reply(200, fixture)
+    mockTUF({ npm, target: TUF_VALID_KEYS_TARGET })
+
+    await npm.exec('audit', ['signatures'])
+
+    t.notOk(process.exitCode, 'should exit successfully')
+    const jsonOutput = JSON.parse(joinedOutput())
+    t.ok(jsonOutput.verified, 'should include verified array')
+    t.equal(jsonOutput.verified.length, 1, 'should have one verified package')
+    t.equal(jsonOutput.verified[0].name, 'sigstore', 'should have correct package name')
+    t.equal(jsonOutput.verified[0].version, '1.0.0', 'should have correct version')
+    t.ok(jsonOutput.verified[0].attestations, 'should include attestations')
+  })
+
+  t.test('with valid attestations --json without --include-attestations', async t => {
+    const { npm, joinedOutput } = await loadMockNpm(t, {
+      prefixDir: installWithValidAttestations,
+      config: {
+        json: true,
+      },
+      mocks: {
+        pacote: t.mock('pacote', {
+          sigstore: { verify: async () => true },
+        }),
+      },
+    })
+    const registry = new MockRegistry({ tap: t, registry: npm.config.get('registry') })
+    await manifestWithValidAttestations({ registry })
+    const fixture = fs.readFileSync(
+      path.resolve(__dirname, '../../fixtures/sigstore/valid-sigstore-attestations.json'),
+      'utf8'
+    )
+    registry.nock.get('/-/npm/v1/attestations/sigstore@1.0.0').reply(200, fixture)
+    mockTUF({ npm, target: TUF_VALID_KEYS_TARGET })
+
+    await npm.exec('audit', ['signatures'])
+
+    t.notOk(process.exitCode, 'should exit successfully')
+    const jsonOutput = JSON.parse(joinedOutput())
+    t.notOk(jsonOutput.verified, 'should not include verified array')
+  })
+
+  t.test('with keyless attestations and no registry keys', async t => {
+    const { npm, joinedOutput } = await loadMockNpm(t, {
+      prefixDir: installWithValidAttestations,
+      mocks: {
+        pacote: t.mock('pacote', {
+          sigstore: { verify: async () => true },
+        }),
+      },
+    })
+    const registry = new MockRegistry({ tap: t, registry: npm.config.get('registry') })
+    const manifest = registry.manifest({
+      name: 'sigstore',
+      packuments: [{
+        version: '1.0.0',
+        dist: {
+          integrity: 'sha512-e+qfbn/zf1+rCza/BhIA//Awmf0v1pa5HQS8Xk8iXrn9bgytytVLqYD' +
+                     '0P7NSqZ6IELTgq+tcDvLPkQjNHyWLNg==',
+          tarball: 'https://registry.npmjs.org/sigstore/-/sigstore-1.0.0.tgz',
+          attestations: {
+            url: 'https://registry.npmjs.org/-/npm/v1/attestations/sigstore@1.0.0',
+            provenance: { predicateType: 'https://slsa.dev/provenance/v0.2' },
+          },
+        },
+      }],
+    })
+    await registry.package({ manifest })
+    const fixture = fs.readFileSync(
+      path.resolve(__dirname, '../../fixtures/sigstore/keyless-sigstore-attestations.json'),
+      'utf8'
+    )
+    registry.nock.get('/-/npm/v1/attestations/sigstore@1.0.0').reply(200, JSON.parse(fixture))
+    // TUF returns no keys and the keys endpoint returns 404
+    mockTUF({ npm, target: TUF_TARGET_NOT_FOUND })
+    registry.nock.get('/-/npm/v1/keys').reply(404)
+
+    await npm.exec('audit', ['signatures'])
+
+    t.notOk(process.exitCode, 'should exit successfully')
+    t.match(joinedOutput(), /1 package has a verified attestation/)
   })
 
   t.test('with multiple valid attestations', async t => {
@@ -2105,4 +2257,32 @@ t.test('audit signatures', async t => {
       )
     })
   })
+})
+
+t.test('audit fix threads allowScripts policy through to arborist', async t => {
+  let capturedOpts
+  const FakeArborist = function (opts) {
+    capturedOpts = opts
+    this.options = opts
+    this.actualTree = { inventory: new Map() }
+    this.auditReport = {}
+  }
+  FakeArborist.prototype.audit = async () => {}
+
+  const { npm } = await loadMockNpm(t, {
+    prefixDir: {
+      'package.json': JSON.stringify({
+        name: 'host',
+        version: '1.0.0',
+        allowScripts: { canvas: true },
+      }),
+    },
+    mocks: {
+      '@npmcli/arborist': FakeArborist,
+      '{LIB}/utils/reify-finish.js': async () => {},
+    },
+  })
+  await npm.exec('audit', ['fix'])
+  t.strictSame(capturedOpts.allowScripts, { canvas: true },
+    'opts.allowScripts populated from package.json')
 })

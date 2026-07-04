@@ -10,6 +10,7 @@
 #include "path.h"
 #include "util-inl.h"
 #include "v8-fast-api-calls.h"
+#include "v8-local-handle.h"
 #include "v8.h"
 
 #include <cstdint>
@@ -21,7 +22,7 @@ namespace url {
 
 using v8::CFunction;
 using v8::Context;
-using v8::FastOneByteString;
+using v8::FastApiCallbackOptions;
 using v8::FunctionCallbackInfo;
 using v8::HandleScope;
 using v8::Isolate;
@@ -69,7 +70,7 @@ void BindingData::Deserialize(Local<Context> context,
                               int index,
                               InternalFieldInfoBase* info) {
   DCHECK_IS_SNAPSHOT_SLOT(index);
-  HandleScope scope(context->GetIsolate());
+  HandleScope scope(Isolate::GetCurrent());
   Realm* realm = Realm::GetCurrent(context);
   BindingData* binding = realm->AddBindingData<BindingData>(holder);
   CHECK_NOT_NULL(binding);
@@ -92,7 +93,6 @@ constexpr auto lookup_table = []() consteval {
   case CHAR:                                                                   \
     result[i] = {{'%', HEX_DIGIT_2, HEX_DIGIT_1, 0}};                          \
     break;
-
       ENCODE_CHAR('\0', '0', '0')  // '\0' == 0x00
       ENCODE_CHAR('\t', '0', '9')  // '\t' == 0x09
       ENCODE_CHAR('\n', '0', 'A')  // '\n' == 0x0A
@@ -168,7 +168,11 @@ void BindingData::PathToFileURL(const FunctionCallbackInfo<Value>& args) {
       [[unlikely]] {
     CHECK(args[2]->IsString());
     Utf8Value hostname(isolate, args[2]);
-    CHECK(out->set_hostname(hostname.ToStringView()));
+    if (!out->set_hostname(hostname.ToStringView())) {
+      return ThrowInvalidURL(realm->env(),
+                             input.ToStringView(),
+                             std::string(hostname.ToStringView()));
+    }
   }
 
   binding_data->UpdateComponents(out->get_components(), out->type);
@@ -282,18 +286,45 @@ void BindingData::CanParse(const FunctionCallbackInfo<Value>& args) {
   args.GetReturnValue().Set(can_parse);
 }
 
-bool BindingData::FastCanParse(Local<Value> receiver,
-                               const FastOneByteString& input) {
+bool BindingData::FastCanParse(
+    Local<Value> receiver,
+    Local<Value> input,
+    // NOLINTNEXTLINE(runtime/references) This is V8 api.
+    FastApiCallbackOptions& options) {
   TRACK_V8_FAST_API_CALL("url.canParse");
-  return ada::can_parse(std::string_view(input.data, input.length));
+  auto isolate = options.isolate;
+  HandleScope handleScope(isolate);
+  Local<String> str;
+  if (!input->ToString(isolate->GetCurrentContext()).ToLocal(&str)) {
+    return false;
+  }
+  Utf8Value utf8(isolate, str);
+  return ada::can_parse(utf8.ToStringView());
 }
 
-bool BindingData::FastCanParseWithBase(Local<Value> receiver,
-                                       const FastOneByteString& input,
-                                       const FastOneByteString& base) {
+bool BindingData::FastCanParseWithBase(
+    Local<Value> receiver,
+    Local<Value> input,
+    Local<Value> base,
+    // NOLINTNEXTLINE(runtime/references) This is V8 api.
+    FastApiCallbackOptions& options) {
   TRACK_V8_FAST_API_CALL("url.canParse.withBase");
-  auto base_view = std::string_view(base.data, base.length);
-  return ada::can_parse(std::string_view(input.data, input.length), &base_view);
+  auto isolate = options.isolate;
+  HandleScope handleScope(isolate);
+  auto context = isolate->GetCurrentContext();
+  Local<String> input_str;
+  if (!input->ToString(context).ToLocal(&input_str)) {
+    return false;
+  }
+  Local<String> base_str;
+  if (!base->ToString(context).ToLocal(&base_str)) {
+    return false;
+  }
+  Utf8Value input_utf8(isolate, input_str);
+  Utf8Value base_utf8(isolate, base_str);
+
+  auto base_view = base_utf8.ToStringView();
+  return ada::can_parse(input_utf8.ToStringView(), &base_view);
 }
 
 CFunction BindingData::fast_can_parse_methods_[] = {
@@ -316,7 +347,13 @@ void BindingData::Format(const FunctionCallbackInfo<Value>& args) {
   // directly want to manipulate the url components without using the respective
   // setters. therefore we are using ada::url here.
   auto out = ada::parse<ada::url>(href.ToStringView());
-  CHECK(out);
+  if (!out) {
+    // If the href cannot be re-parsed (e.g. due to ada parser inconsistencies
+    // with certain IDN hostnames), return the original href unmodified rather
+    // than crashing.
+    args.GetReturnValue().Set(args[0]);
+    return;
+  }
 
   if (!hash) {
     out->hash = std::nullopt;
@@ -397,8 +434,11 @@ void BindingData::Update(const FunctionCallbackInfo<Value>& args) {
   BindingData* binding_data = realm->GetBindingData<BindingData>();
   Isolate* isolate = realm->isolate();
 
-  enum url_update_action action = static_cast<enum url_update_action>(
-      args[1]->Uint32Value(realm->context()).FromJust());
+  uint32_t val;
+  if (!args[1]->Uint32Value(realm->context()).To(&val)) {
+    return;
+  }
+  enum url_update_action action = static_cast<enum url_update_action>(val);
   Utf8Value input(isolate, args[0].As<String>());
   Utf8Value new_value(isolate, args[2].As<String>());
 
@@ -513,11 +553,8 @@ void BindingData::RegisterExternalReferences(
   registry->Register(PathToFileURL);
   registry->Register(Update);
   registry->Register(CanParse);
-  registry->Register(FastCanParse);
-  registry->Register(FastCanParseWithBase);
-
   for (const CFunction& method : fast_can_parse_methods_) {
-    registry->Register(method.GetTypeInfo());
+    registry->Register(method);
   }
 }
 

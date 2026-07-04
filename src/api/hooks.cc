@@ -26,10 +26,6 @@ void AtExit(Environment* env, void (*cb)(void* arg), void* arg) {
   env->AtExit(cb, arg);
 }
 
-void EmitBeforeExit(Environment* env) {
-  USE(EmitProcessBeforeExit(env));
-}
-
 Maybe<bool> EmitProcessBeforeExit(Environment* env) {
   TRACE_EVENT0(TRACING_CATEGORY_NODE1(environment), "BeforeExit");
   if (!env->destroy_async_id_list()->empty())
@@ -50,14 +46,6 @@ Maybe<bool> EmitProcessBeforeExit(Environment* env) {
                                                              : Just(true);
 }
 
-static ExitCode EmitExitInternal(Environment* env) {
-  return EmitProcessExitInternal(env).FromMaybe(ExitCode::kGenericUserError);
-}
-
-int EmitExit(Environment* env) {
-  return static_cast<int>(EmitExitInternal(env));
-}
-
 Maybe<ExitCode> EmitProcessExitInternal(Environment* env) {
   // process.emit('exit')
   Isolate* isolate = env->isolate();
@@ -70,14 +58,26 @@ Maybe<ExitCode> EmitProcessExitInternal(Environment* env) {
     return Nothing<ExitCode>();
   }
 
-  Local<Integer> exit_code = Integer::New(
-      isolate, static_cast<int32_t>(env->exit_code(ExitCode::kNoFailure)));
+  ExitCode exit_code = env->exit_code(ExitCode::kNoFailure);
 
-  if (ProcessEmit(env, "exit", exit_code).IsEmpty()) {
+  // the exit code wasn't already set, so let's check for unsettled tlas
+  if (exit_code == ExitCode::kNoFailure) {
+    auto unsettled_tla = env->CheckUnsettledTopLevelAwait();
+    if (!unsettled_tla.FromJust()) {
+      exit_code = ExitCode::kUnsettledTopLevelAwait;
+      env->set_exit_code(exit_code);
+    }
+  }
+
+  Local<Integer> exit_code_int =
+      Integer::New(isolate, static_cast<int32_t>(exit_code));
+
+  if (ProcessEmit(env, "exit", exit_code_int).IsEmpty()) {
     return Nothing<ExitCode>();
   }
+
   // Reload exit code, it may be changed by `emit('exit')`
-  return Just(env->exit_code(ExitCode::kNoFailure));
+  return Just(env->exit_code(exit_code));
 }
 
 Maybe<int> EmitProcessExit(Environment* env) {
@@ -115,20 +115,71 @@ struct ACHHandle final {
 // this.
 void DeleteACHHandle::operator ()(ACHHandle* handle) const { delete handle; }
 
+// TODO(addaleax): Having this extra set of data structures is far from
+// ideal, but unfortunately the public synchronous cleanup hook API was
+// slightly mis-designed; in particular, RemoveEnvironmentCleanupHook() needs
+// to keep working when the Isolate either has no active context (such as
+// during GC) or that context is associated with another Node.js Environment.
+// We should align this with the asynchronous API, which handles this properly
+// through an explicit reference to the cleanup hook instead of requiring
+// lookups in internal maps.
+struct CleanupHookThunk final {
+  Isolate* isolate;
+  Environment* env;
+  CleanupHook fun;
+  void* arg;
+
+  bool operator==(const CleanupHookThunk& other) const {
+    // `env` is intentionally not part of this comparison
+    return isolate == other.isolate && fun == other.fun && arg == other.arg;
+  }
+};
+struct CleanupHookThunkHash {
+  size_t operator()(const CleanupHookThunk& thunk) const {
+    return std::hash<void*>()(thunk.arg);
+  }
+};
+using CleanupHookRegistry =
+    std::unordered_set<CleanupHookThunk, CleanupHookThunkHash>;
+static ExclusiveAccess<CleanupHookRegistry> cleanup_hook_registry;
+
+static void CleanupHookThunkRun(void* arg) {
+  const CleanupHookThunk* thunk = static_cast<CleanupHookThunk*>(arg);
+  thunk->fun(thunk->arg);
+  RemoveEnvironmentCleanupHook(thunk->isolate, thunk->fun, thunk->arg);
+}
+
 void AddEnvironmentCleanupHook(Isolate* isolate,
                                CleanupHook fun,
                                void* arg) {
   Environment* env = Environment::GetCurrent(isolate);
   CHECK_NOT_NULL(env);
-  env->AddCleanupHook(fun, arg);
+  void* wrapped_arg;
+  {
+    ExclusiveAccess<CleanupHookRegistry>::Scoped registry(
+        &cleanup_hook_registry);
+    auto result = registry->insert({isolate, env, fun, arg});
+    CHECK(result.second);
+    wrapped_arg = const_cast<CleanupHookThunk*>(&*result.first);
+  }
+  env->AddCleanupHook(CleanupHookThunkRun, wrapped_arg);
 }
 
 void RemoveEnvironmentCleanupHook(Isolate* isolate,
                                   CleanupHook fun,
                                   void* arg) {
-  Environment* env = Environment::GetCurrent(isolate);
-  CHECK_NOT_NULL(env);
-  env->RemoveCleanupHook(fun, arg);
+  CleanupHookThunk thunk;
+  void* wrapped_arg;
+  {
+    ExclusiveAccess<CleanupHookRegistry>::Scoped registry(
+        &cleanup_hook_registry);
+    auto result = registry->find({isolate, nullptr, fun, arg});
+    if (result == registry->end()) return;
+    wrapped_arg = const_cast<CleanupHookThunk*>(&*result);
+    thunk = *result;
+    registry->erase(result);
+  }
+  thunk.env->RemoveCleanupHook(CleanupHookThunkRun, wrapped_arg);
 }
 
 static void FinishAsyncCleanupHook(void* arg) {
@@ -184,6 +235,12 @@ async_id AsyncHooksGetExecutionAsyncId(Isolate* isolate) {
   return env->execution_async_id();
 }
 
+async_id AsyncHooksGetExecutionAsyncId(Local<Context> context) {
+  Environment* env = Environment::GetCurrent(context);
+  if (env == nullptr) return -1;
+  return env->execution_async_id();
+}
+
 async_id AsyncHooksGetTriggerAsyncId(Isolate* isolate) {
   Environment* env = Environment::GetCurrent(isolate);
   if (env == nullptr) return -1;
@@ -195,9 +252,18 @@ async_context EmitAsyncInit(Isolate* isolate,
                             Local<Object> resource,
                             const char* name,
                             async_id trigger_async_id) {
+  return EmitAsyncInit(
+      isolate, resource, std::string_view(name), trigger_async_id);
+}
+
+async_context EmitAsyncInit(Isolate* isolate,
+                            Local<Object> resource,
+                            std::string_view name,
+                            async_id trigger_async_id) {
   HandleScope handle_scope(isolate);
   Local<String> type =
-      String::NewFromUtf8(isolate, name, NewStringType::kInternalized)
+      String::NewFromUtf8(
+          isolate, name.data(), NewStringType::kInternalized, name.size())
           .ToLocalChecked();
   return EmitAsyncInit(isolate, resource, type, trigger_async_id);
 }

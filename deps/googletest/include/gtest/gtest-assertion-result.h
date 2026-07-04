@@ -129,8 +129,15 @@ namespace testing {
 //
 //   Expected: Foo() is even
 //     Actual: it's 5
+//
 
-class GTEST_API_ AssertionResult {
+// Returned AssertionResult objects may not be ignored.
+// Note: Disabled for SWIG as it doesn't parse attributes correctly.
+#if !defined(SWIG)
+class [[nodiscard]] AssertionResult;
+#endif  // !SWIG
+
+class GTEST_API_ [[nodiscard]] AssertionResult {
  public:
   // Copy constructor.
   // Used in EXPECT_TRUE/FALSE(assertion_result).
@@ -154,8 +161,7 @@ class GTEST_API_ AssertionResult {
   template <typename T>
   explicit AssertionResult(
       const T& success,
-      typename std::enable_if<
-          !std::is_convertible<T, AssertionResult>::value>::type*
+      std::enable_if_t<!std::is_convertible_v<T, AssertionResult>>*
       /*enabler*/
       = nullptr)
       : success_(success) {}

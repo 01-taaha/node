@@ -1,13 +1,11 @@
 import {
+  globals,
   noRestrictedSyntaxCommonAll,
   noRestrictedSyntaxCommonLib,
-  requireEslintTool,
 } from '../tools/eslint/eslint.config_utils.mjs';
 import { builtinModules } from 'node:module';
 
 const builtin = builtinModules.filter((name) => !name.startsWith('node:'));
-
-const globals = requireEslintTool('globals');
 
 export default [
   {
@@ -22,6 +20,15 @@ export default [
         {
           selector: `CallExpression[callee.name="require"][arguments.0.type="Literal"]:matches(${builtin.map((name) => `[arguments.0.value="${name}"]`).join(',')}),ImportDeclaration:matches(${builtin.map((name) => `[source.value="${name}"]`).join(',')})`,
           message: 'Use `node:` prefix.',
+        },
+        {
+          selector: 'Program>ExpressionStatement:first-child[expression.value="use strict"]',
+          message: 'Do not include "use strict" statement',
+        },
+        {
+          selector: 'VariableDeclarator[id.name="process"][init.callee.name="require"]' +
+                    '[init.arguments.0.value="node:process"]',
+          message: 'Use global "process" in CJS snippets',
         },
       ],
       'no-undef': 'off',

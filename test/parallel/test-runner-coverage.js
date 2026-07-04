@@ -77,6 +77,22 @@ function getSpecCoverageFixtureReport() {
   return report;
 }
 
+function formatSpawnSyncResult(result) {
+  return [
+    `status: ${result.status}`,
+    `signal: ${result.signal}`,
+    `stdout:\n${result.stdout}`,
+    `stderr:\n${result.stderr}`,
+  ].join('\n');
+}
+
+function assertIncludesReport(result, report) {
+  assert(
+    result.stdout.toString().includes(report),
+    formatSpawnSyncResult(result),
+  );
+}
+
 test('test coverage report', async (t) => {
   await t.test('handles the inspector not being available', (t) => {
     if (process.features.inspector) {
@@ -111,7 +127,7 @@ test('test tap coverage reporter', skipIfNoInspector, async (t) => {
     const options = { env: { ...process.env, NODE_V8_COVERAGE: tmpdir.path } };
     const result = spawnSync(process.execPath, args, options);
     const report = getTapCoverageFixtureReport();
-    assert(result.stdout.toString().includes(report));
+    assertIncludesReport(result, report);
     assert.strictEqual(result.stderr.toString(), '');
     assert.strictEqual(result.status, 0);
     assert(findCoverageFileForPid(result.pid));
@@ -129,7 +145,7 @@ test('test tap coverage reporter', skipIfNoInspector, async (t) => {
     const result = spawnSync(process.execPath, args);
     const report = getTapCoverageFixtureReport();
 
-    assert(result.stdout.toString().includes(report));
+    assertIncludesReport(result, report);
     assert.strictEqual(result.stderr.toString(), '');
     assert.strictEqual(result.status, 0);
     assert(!findCoverageFileForPid(result.pid));
@@ -149,7 +165,7 @@ test('test spec coverage reporter', skipIfNoInspector, async (t) => {
     const result = spawnSync(process.execPath, args, options);
     const report = getSpecCoverageFixtureReport();
 
-    assert(result.stdout.toString().includes(report));
+    assertIncludesReport(result, report);
     assert.strictEqual(result.stderr.toString(), '');
     assert.strictEqual(result.status, 0);
     assert(findCoverageFileForPid(result.pid));
@@ -166,7 +182,7 @@ test('test spec coverage reporter', skipIfNoInspector, async (t) => {
     const result = spawnSync(process.execPath, args);
     const report = getSpecCoverageFixtureReport();
 
-    assert(result.stdout.toString().includes(report));
+    assertIncludesReport(result, report);
     assert.strictEqual(result.stderr.toString(), '');
     assert.strictEqual(result.status, 0);
     assert(!findCoverageFileForPid(result.pid));
@@ -187,7 +203,7 @@ test('single process coverage is the same with --test', skipIfNoInspector, () =>
   const report = getTapCoverageFixtureReport();
 
   assert.strictEqual(result.stderr.toString(), '');
-  assert(result.stdout.toString().includes(report));
+  assertIncludesReport(result, report);
   assert.strictEqual(result.status, 0);
   assert(!findCoverageFileForPid(result.pid));
 });
@@ -226,11 +242,11 @@ test('coverage is combined for multiple processes', skipIfNoInspector, () => {
   });
 
   assert.strictEqual(result.stderr.toString(), '');
-  assert(result.stdout.toString().includes(report));
+  assertIncludesReport(result, report);
   assert.strictEqual(result.status, 0);
 });
 
-test.skip('coverage works with isolation=none', skipIfNoInspector, () => {
+test.skip('coverage works with isolation=none', skipIfNoInspector, common.mustCallAtLeast(() => {
   // There is a bug in coverage calculation. The branch % in the common.js
   // fixture is different depending on the test isolation mode. The 'none' mode
   // is closer to what c8 reports here, so the bug is likely in the code that
@@ -268,9 +284,9 @@ test.skip('coverage works with isolation=none', skipIfNoInspector, () => {
   });
 
   assert.strictEqual(result.stderr.toString(), '');
-  assert(result.stdout.toString().includes(report));
+  assertIncludesReport(result, report);
   assert.strictEqual(result.status, 0);
-});
+}, 0));
 
 test('coverage reports on lines, functions, and branches', skipIfNoInspector, async (t) => {
   const fixture = fixtures.path('test-runner', 'coverage.js');
@@ -285,14 +301,15 @@ test('coverage reports on lines, functions, and branches', skipIfNoInspector, as
                           ]);
   assert.strictEqual(child.stderr.toString(), '');
   const stdout = child.stdout.toString();
+  assert.notStrictEqual(stdout, '', formatSpawnSyncResult(child));
   const coverage = JSON.parse(stdout);
 
   await t.test('does not include node_modules', () => {
     assert.strictEqual(coverage.summary.files.length, 3);
     const files = ['coverage.js', 'invalid-tap.js', 'throw.js'];
-    coverage.summary.files.forEach((file, index) => {
+    coverage.summary.files.forEach(common.mustCallAtLeast((file, index) => {
       assert.ok(file.path.endsWith(files[index]));
-    });
+    }));
   });
 
   const file = coverage.summary.files[0];
@@ -366,7 +383,7 @@ test('coverage with ESM hook - source irrelevant', skipIfNoInspector, () => {
   const result = spawnSync(process.execPath, args, { cwd: fixture });
 
   assert.strictEqual(result.stderr.toString(), '');
-  assert(result.stdout.toString().includes(report));
+  assertIncludesReport(result, report);
   assert.strictEqual(result.status, 0);
 });
 
@@ -401,7 +418,7 @@ test('coverage with ESM hook - source transpiled', skipIfNoInspector, () => {
   const result = spawnSync(process.execPath, args, { cwd: fixture });
 
   assert.strictEqual(result.stderr.toString(), '');
-  assert(result.stdout.toString().includes(report));
+  assertIncludesReport(result, report);
   assert.strictEqual(result.status, 0);
 });
 
@@ -435,7 +452,7 @@ test('coverage with excluded files', skipIfNoInspector, () => {
     return report.replaceAll('/', '\\');
   }
 
-  assert(result.stdout.toString().includes(report));
+  assertIncludesReport(result, report);
   assert.strictEqual(result.status, 0);
   assert(!findCoverageFileForPid(result.pid));
 });
@@ -472,7 +489,7 @@ test('coverage with included files', skipIfNoInspector, () => {
     return report.replaceAll('/', '\\');
   }
 
-  assert(result.stdout.toString().includes(report));
+  assertIncludesReport(result, report);
   assert.strictEqual(result.status, 0);
   assert(!findCoverageFileForPid(result.pid));
 });
@@ -506,7 +523,7 @@ test('coverage with included and excluded files', skipIfNoInspector, () => {
     return report.replaceAll('/', '\\');
   }
 
-  assert(result.stdout.toString().includes(report));
+  assertIncludesReport(result, report);
   assert.strictEqual(result.status, 0);
   assert(!findCoverageFileForPid(result.pid));
 });
@@ -547,6 +564,22 @@ test('correctly prints the coverage report of files contained in parent director
   });
 
   assert.strictEqual(result.stderr.toString(), '');
-  assert(result.stdout.toString().includes(report));
+  assertIncludesReport(result, report);
   assert.strictEqual(result.status, 0);
+});
+
+// Regression test for https://github.com/nodejs/node/issues/61080
+test('coverage with directory and file named "file"', skipIfNoInspector, () => {
+  const fixture = fixtures.path('test-runner', 'coverage-file-name', 'test.js');
+  const args = [
+    '--experimental-test-coverage',
+    '--test-reporter',
+    'tap',
+    fixture,
+  ];
+  const result = spawnSync(process.execPath, args);
+
+  assert.strictEqual(result.stderr.toString(), '');
+  assert.strictEqual(result.status, 0);
+  assertIncludesReport(result, 'start of coverage report');
 });

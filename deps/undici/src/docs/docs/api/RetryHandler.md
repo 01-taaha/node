@@ -4,12 +4,12 @@ Extends: `undici.DispatcherHandlers`
 
 A handler class that implements the retry logic for a request.
 
-## `new RetryHandler(dispatchOptions, retryHandlers, [retryOptions])`
+## `new RetryHandler(opts, { dispatch, handler })`
 
 Arguments:
 
-- **options** `Dispatch.DispatchOptions & RetryOptions` (required) - It is an intersection of `Dispatcher.DispatchOptions` and `RetryOptions`.
-- **retryHandlers** `RetryHandlers` (required) - Object containing the `dispatch` to be used on every retry, and `handler` for handling the `dispatch` lifecycle.
+- **opts** `Dispatch.DispatchOptions & { retryOptions?: RetryOptions }` (required) - An intersection of `Dispatcher.DispatchOptions` and an optional `RetryOptions` object.
+- **{ dispatch, handler }** `RetryHandlers` (required) - Object containing the `dispatch` to be used on every retry, and `handler` for handling the `dispatch` lifecycle.
 
 Returns: `retryHandler`
 
@@ -19,16 +19,16 @@ Extends: [`Dispatch.DispatchOptions`](/docs/docs/api/Dispatcher.md#parameter-dis
 
 #### `RetryOptions`
 
-- **retry** `(err: Error, context: RetryContext, callback: (err?: Error | null) => void) => number | null` (optional) - Function to be called after every retry. It should pass error if no more retries should be performed.
+- **throwOnError** `boolean` (optional) - Disable to prevent throwing error on last retry attept, useful if you need the body on errors from server or if you have custom error handler.
+- **retry** `(err: Error, context: RetryContext, callback: (err?: Error | null) => void) => void` (optional) - Function to be called after every retry. It should pass error if no more retries should be performed.
 - **maxRetries** `number` (optional) - Maximum number of retries. Default: `5`
 - **maxTimeout** `number` (optional) - Maximum number of milliseconds to wait before retrying. Default: `30000` (30 seconds)
 - **minTimeout** `number` (optional) - Minimum number of milliseconds to wait before retrying. Default: `500` (half a second)
 - **timeoutFactor** `number` (optional) - Factor to multiply the timeout by for each retry attempt. Default: `2`
 - **retryAfter** `boolean` (optional) - It enables automatic retry after the `Retry-After` header is received. Default: `true`
--
-- **methods** `string[]` (optional) - Array of HTTP methods to retry. Default: `['GET', 'PUT', 'HEAD', 'OPTIONS', 'DELETE']`
+- **methods** `string[]` (optional) - Array of HTTP methods to retry. Default: `['GET', 'HEAD', 'OPTIONS', 'PUT', 'DELETE', 'TRACE']`
 - **statusCodes** `number[]` (optional) - Array of HTTP status codes to retry. Default: `[429, 500, 502, 503, 504]`
-- **errorCodes** `string[]` (optional) - Array of Error codes to retry. Default: `['ECONNRESET', 'ECONNREFUSED', 'ENOTFOUND', 'ENETDOWN','ENETUNREACH', 'EHOSTDOWN', 'UND_ERR_SOCKET']`
+- **errorCodes** `string[]` (optional) - Array of Error codes to retry. Default: `['ECONNRESET', 'ECONNREFUSED', 'ENOTFOUND', 'ENETDOWN', 'ENETUNREACH', 'EHOSTDOWN', 'EHOSTUNREACH', 'EPIPE', 'UND_ERR_SOCKET']`
 
 **`RetryContext`**
 
@@ -81,17 +81,16 @@ const handler = new RetryHandler(
       return client.dispatch(...args);
     },
     handler: {
-      onConnect() {},
-      onBodySent() {},
-      onHeaders(status, _rawHeaders, resume, _statusMessage) {
+      onRequestStart() {},
+      onBodySent(chunk) {},
+      onResponseStart(_controller, status, headers) {
         // do something with headers
       },
-      onData(chunk) {
+      onResponseData(_controller, chunk) {
         chunks.push(chunk);
-        return true;
       },
-      onComplete() {},
-      onError() {
+      onResponseEnd() {},
+      onResponseError(_controller, err) {
         // handle error properly
       },
     },
@@ -106,12 +105,12 @@ const client = new Client(`http://localhost:${server.address().port}`);
 const handler = new RetryHandler(dispatchOptions, {
   dispatch: client.dispatch.bind(client),
   handler: {
-    onConnect() {},
-    onBodySent() {},
-    onHeaders(status, _rawHeaders, resume, _statusMessage) {},
-    onData(chunk) {},
-    onComplete() {},
-    onError(err) {},
+    onRequestStart() {},
+    onBodySent(chunk) {},
+    onResponseStart(_controller, status, headers) {},
+    onResponseData(_controller, chunk) {},
+    onResponseEnd() {},
+    onResponseError(_controller, err) {},
   },
 });
 ```

@@ -49,9 +49,17 @@ using v8::Nothing;
 using v8::Number;
 using v8::Object;
 using v8::String;
+using v8::Uint32;
 using v8::Value;
 
 namespace {
+
+enum ProcessFlags : uint32_t {
+  kProcessFlagNone = 0,
+  kProcessFlagDetached = 1 << 0,
+  kProcessFlagWindowsHide = 1 << 1,
+  kProcessFlagWindowsVerbatimArguments = 1 << 2,
+};
 
 class ProcessWrap : public HandleWrap {
  public:
@@ -71,6 +79,12 @@ class ProcessWrap : public HandleWrap {
     SetProtoMethod(isolate, constructor, "kill", Kill);
 
     SetConstructorFunction(context, target, "Process", constructor);
+
+    Local<Object> constants = Object::New(isolate);
+    NODE_DEFINE_CONSTANT(constants, kProcessFlagDetached);
+    NODE_DEFINE_CONSTANT(constants, kProcessFlagWindowsHide);
+    NODE_DEFINE_CONSTANT(constants, kProcessFlagWindowsVerbatimArguments);
+    target->Set(context, env->constants_string(), constants).Check();
   }
 
   static void RegisterExternalReferences(ExternalReferenceRegistry* registry) {
@@ -116,15 +130,11 @@ class ProcessWrap : public HandleWrap {
     return Just(stream);
   }
 
-  static Maybe<void> ParseStdioOptions(Environment* env,
-                                       Local<Object> js_options,
-                                       uv_process_options_t* options) {
+  static Maybe<void> ParseStdioOptions(
+      Environment* env,
+      Local<Value> stdios_val,
+      std::vector<uv_stdio_container_t>* options_stdio) {
     Local<Context> context = env->context();
-    Local<String> stdio_key = env->stdio_string();
-    Local<Value> stdios_val;
-    if (!js_options->Get(context, stdio_key).ToLocal(&stdios_val)) {
-      return Nothing<void>();
-    }
     if (!stdios_val->IsArray()) {
       THROW_ERR_INVALID_ARG_TYPE(env, "options.stdio must be an array");
       return Nothing<void>();
@@ -132,8 +142,7 @@ class ProcessWrap : public HandleWrap {
     Local<Array> stdios = stdios_val.As<Array>();
 
     uint32_t len = stdios->Length();
-    options->stdio = new uv_stdio_container_t[len];
-    options->stdio_count = len;
+    options_stdio->resize(len);
 
     for (uint32_t i = 0; i < len; i++) {
       Local<Value> val;
@@ -147,23 +156,23 @@ class ProcessWrap : public HandleWrap {
       }
 
       if (type->StrictEquals(env->ignore_string())) {
-        options->stdio[i].flags = UV_IGNORE;
+        (*options_stdio)[i].flags = UV_IGNORE;
       } else if (type->StrictEquals(env->pipe_string())) {
-        options->stdio[i].flags = static_cast<uv_stdio_flags>(
+        (*options_stdio)[i].flags = static_cast<uv_stdio_flags>(
             UV_CREATE_PIPE | UV_READABLE_PIPE | UV_WRITABLE_PIPE);
-        if (!StreamForWrap(env, stdio).To(&options->stdio[i].data.stream)) {
+        if (!StreamForWrap(env, stdio).To(&(*options_stdio)[i].data.stream)) {
           return Nothing<void>();
         }
       } else if (type->StrictEquals(env->overlapped_string())) {
-        options->stdio[i].flags = static_cast<uv_stdio_flags>(
-            UV_CREATE_PIPE | UV_READABLE_PIPE | UV_WRITABLE_PIPE |
-            UV_OVERLAPPED_PIPE);
-        if (!StreamForWrap(env, stdio).To(&options->stdio[i].data.stream)) {
+        (*options_stdio)[i].flags =
+            static_cast<uv_stdio_flags>(UV_CREATE_PIPE | UV_READABLE_PIPE |
+                                        UV_WRITABLE_PIPE | UV_OVERLAPPED_PIPE);
+        if (!StreamForWrap(env, stdio).To(&(*options_stdio)[i].data.stream)) {
           return Nothing<void>();
         }
       } else if (type->StrictEquals(env->wrap_string())) {
-        options->stdio[i].flags = UV_INHERIT_STREAM;
-        if (!StreamForWrap(env, stdio).To(&options->stdio[i].data.stream)) {
+        (*options_stdio)[i].flags = UV_INHERIT_STREAM;
+        if (!StreamForWrap(env, stdio).To(&(*options_stdio)[i].data.stream)) {
           return Nothing<void>();
         }
       } else {
@@ -173,9 +182,9 @@ class ProcessWrap : public HandleWrap {
           return Nothing<void>();
         }
         CHECK(fd_value->IsNumber());
-        int fd = static_cast<int>(fd_value.As<Integer>()->Value());
-        options->stdio[i].flags = UV_INHERIT_FD;
-        options->stdio[i].data.fd = fd;
+        int fd = FromV8Value<int>(fd_value);
+        (*options_stdio)[i].flags = UV_INHERIT_FD;
+        (*options_stdio)[i].data.fd = fd;
       }
     }
     return JustVoid();
@@ -186,26 +195,23 @@ class ProcessWrap : public HandleWrap {
     Local<Context> context = env->context();
     ProcessWrap* wrap;
     ASSIGN_OR_RETURN_UNWRAP(&wrap, args.This());
-    THROW_IF_INSUFFICIENT_PERMISSIONS(
-        env, permission::PermissionScope::kChildProcess, "");
     int err = 0;
-
-    if (!args[0]->IsObject()) {
-      return THROW_ERR_INVALID_ARG_TYPE(env, "options must be an object");
-    }
-
-    Local<Object> js_options = args[0].As<Object>();
 
     uv_process_options_t options;
     memset(&options, 0, sizeof(uv_process_options_t));
 
     options.exit_cb = OnExit;
 
-    // options.uid
-    Local<Value> uid_v;
-    if (!js_options->Get(context, env->uid_string()).ToLocal(&uid_v)) {
-      return;
-    }
+    // args[0] file
+    CHECK(args[0]->IsString());
+    node::Utf8Value file(env->isolate(), args[0]);
+    options.file = *file;
+
+    THROW_IF_INSUFFICIENT_PERMISSIONS(
+        env, permission::PermissionScope::kChildProcess, file.ToStringView());
+
+    // args[6] uid
+    Local<Value> uid_v = args[6];
     if (!uid_v->IsUndefined() && !uid_v->IsNull()) {
       CHECK(uid_v->IsInt32());
       const int32_t uid = uid_v.As<Int32>()->Value();
@@ -213,28 +219,14 @@ class ProcessWrap : public HandleWrap {
       options.uid = static_cast<uv_uid_t>(uid);
     }
 
-    // options.gid
-    Local<Value> gid_v;
-    if (!js_options->Get(context, env->gid_string()).ToLocal(&gid_v)) {
-      return;
-    }
+    // args[7] gid
+    Local<Value> gid_v = args[7];
     if (!gid_v->IsUndefined() && !gid_v->IsNull()) {
       CHECK(gid_v->IsInt32());
       const int32_t gid = gid_v.As<Int32>()->Value();
       options.flags |= UV_PROCESS_SETGID;
       options.gid = static_cast<uv_gid_t>(gid);
     }
-
-    // TODO(bnoordhuis) is this possible to do without mallocing ?
-
-    // options.file
-    Local<Value> file_v;
-    if (!js_options->Get(context, env->file_string()).ToLocal(&file_v)) {
-      return;
-    }
-    CHECK(file_v->IsString());
-    node::Utf8Value file(env->isolate(), file_v);
-    options.file = *file;
 
     // Undocumented feature of Win32 CreateProcess API allows spawning
     // batch files directly but is potentially insecure because arguments
@@ -245,76 +237,76 @@ class ProcessWrap : public HandleWrap {
       err = UV_EINVAL;
 #endif
 
-    // options.args
-    Local<Value> argv_v;
-    if (!js_options->Get(context, env->args_string()).ToLocal(&argv_v)) {
-      return;
-    }
-    if (!argv_v.IsEmpty() && argv_v->IsArray()) {
-      Local<Array> js_argv = argv_v.As<Array>();
+    // args[1] args
+    std::vector<char*> options_args;
+    std::vector<std::string> args_vals;
+    if (args[1]->IsArray()) {
+      Local<Array> js_argv = args[1].As<Array>();
       int argc = js_argv->Length();
       CHECK_LT(argc, INT_MAX);  // Check for overflow.
-
-      // Heap allocate to detect errors. +1 is for nullptr.
-      options.args = new char*[argc + 1];
+      args_vals.reserve(argc);
       for (int i = 0; i < argc; i++) {
         Local<Value> val;
         if (!js_argv->Get(context, i).ToLocal(&val)) {
           return;
         }
         node::Utf8Value arg(env->isolate(), val);
-        options.args[i] = strdup(*arg);
-        CHECK_NOT_NULL(options.args[i]);
+        args_vals.emplace_back(arg.ToString());
       }
-      options.args[argc] = nullptr;
+      options_args.resize(args_vals.size() + 1);
+      for (size_t i = 0; i < args_vals.size(); i++) {
+        options_args[i] = const_cast<char*>(args_vals[i].c_str());
+        CHECK_NOT_NULL(options_args[i]);
+      }
+      options_args.back() = nullptr;
+      options.args = options_args.data();
     }
 
-    // options.cwd
-    Local<Value> cwd_v;
-    if (!js_options->Get(context, env->cwd_string()).ToLocal(&cwd_v)) {
-      return;
-    }
+    // args[2] cwd
     node::Utf8Value cwd(env->isolate(),
-                        cwd_v->IsString() ? cwd_v : Local<Value>());
+                        args[2]->IsString() ? args[2] : Local<Value>());
     if (cwd.length() > 0) {
       options.cwd = *cwd;
     }
 
-    // options.env
-    Local<Value> env_v;
-    if (!js_options->Get(context, env->env_pairs_string()).ToLocal(&env_v)) {
-      return;
-    }
-    if (!env_v.IsEmpty() && env_v->IsArray()) {
-      Local<Array> env_opt = env_v.As<Array>();
+    // args[3] envPairs
+    std::vector<char*> options_env;
+    std::vector<std::string> env_vals;
+    if (args[3]->IsArray()) {
+      Local<Array> env_opt = args[3].As<Array>();
       int envc = env_opt->Length();
       CHECK_LT(envc, INT_MAX);            // Check for overflow.
-      options.env = new char*[envc + 1];  // Heap allocated to detect errors.
+      env_vals.reserve(envc);
       for (int i = 0; i < envc; i++) {
         Local<Value> val;
         if (!env_opt->Get(context, i).ToLocal(&val)) {
           return;
         }
         node::Utf8Value pair(env->isolate(), val);
-        options.env[i] = strdup(*pair);
-        CHECK_NOT_NULL(options.env[i]);
+        env_vals.emplace_back(pair.ToString());
       }
-      options.env[envc] = nullptr;
+      options_env.resize(env_vals.size() + 1);
+      for (size_t i = 0; i < env_vals.size(); i++) {
+        options_env[i] = const_cast<char*>(env_vals[i].c_str());
+        CHECK_NOT_NULL(options_env[i]);
+      }
+      options_env.back() = nullptr;
+      options.env = options_env.data();
     }
 
-    // options.stdio
-    if (ParseStdioOptions(env, js_options, &options).IsNothing()) {
+    // args[4] stdio
+    std::vector<uv_stdio_container_t> options_stdio;
+    if (ParseStdioOptions(env, args[4], &options_stdio).IsNothing()) {
       return;
     }
+    options.stdio = options_stdio.data();
+    options.stdio_count = options_stdio.size();
 
-    // options.windowsHide
-    Local<Value> hide_v;
-    if (!js_options->Get(context, env->windows_hide_string())
-             .ToLocal(&hide_v)) {
-      return;
-    }
+    // args[5] flags (detached, windowsHide, windowsVerbatimArguments)
+    CHECK(args[5]->IsUint32());
+    const uint32_t flags = args[5].As<Uint32>()->Value();
 
-    if (hide_v->IsTrue()) {
+    if (flags & kProcessFlagWindowsHide) {
       options.flags |= UV_PROCESS_WINDOWS_HIDE;
     }
 
@@ -322,25 +314,11 @@ class ProcessWrap : public HandleWrap {
       options.flags |= UV_PROCESS_WINDOWS_HIDE_CONSOLE;
     }
 
-    // options.windows_verbatim_arguments
-    Local<Value> wva_v;
-    if (!js_options->Get(context, env->windows_verbatim_arguments_string())
-             .ToLocal(&wva_v)) {
-      return;
-    }
-
-    if (wva_v->IsTrue()) {
+    if (flags & kProcessFlagWindowsVerbatimArguments) {
       options.flags |= UV_PROCESS_WINDOWS_VERBATIM_ARGUMENTS;
     }
 
-    // options.detached
-    Local<Value> detached_v;
-    if (!js_options->Get(context, env->detached_string())
-             .ToLocal(&detached_v)) {
-      return;
-    }
-
-    if (detached_v->IsTrue()) {
+    if (flags & kProcessFlagDetached) {
       options.flags |= UV_PROCESS_DETACHED;
     }
 
@@ -360,18 +338,6 @@ class ProcessWrap : public HandleWrap {
       }
     }
 
-    if (options.args) {
-      for (int i = 0; options.args[i]; i++) free(options.args[i]);
-      delete [] options.args;
-    }
-
-    if (options.env) {
-      for (int i = 0; options.env[i]; i++) free(options.env[i]);
-      delete [] options.env;
-    }
-
-    delete[] options.stdio;
-
     args.GetReturnValue().Set(err);
   }
 
@@ -379,10 +345,13 @@ class ProcessWrap : public HandleWrap {
     Environment* env = Environment::GetCurrent(args);
     ProcessWrap* wrap;
     ASSIGN_OR_RETURN_UNWRAP(&wrap, args.This());
-    int signal = args[0]->Int32Value(env->context()).FromJust();
+    int signal;
+    if (!args[0]->Int32Value(env->context()).To(&signal)) {
+      return;
+    }
 #ifdef _WIN32
     if (signal != SIGKILL && signal != SIGTERM && signal != SIGINT &&
-        signal != SIGQUIT) {
+        signal != SIGQUIT && signal != 0) {
       signal = SIGKILL;
     }
 #endif

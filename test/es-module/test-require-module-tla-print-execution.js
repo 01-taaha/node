@@ -1,6 +1,7 @@
 'use strict';
 
-// Tests that require(esm) with top-level-await throws after execution
+// Tests that require(esm) with top-level-await throws before execution starts
+// and attaches the location of the top-level await to the error
 // if --experimental-print-required-tla is enabled.
 
 const common = require('../common');
@@ -16,14 +17,17 @@ const fixtures = require('../common/fixtures');
     signal: null,
     status: 1,
     stderr(output) {
-      assert.match(output, /I am executed/);
+      output = output.replace(/\r/g, '');
+      assert.doesNotMatch(output, /I am executed/);
       common.expectRequiredTLAError(output);
-      assert.match(output, /Error: unexpected top-level await at.*execution\.mjs:3/);
-      assert.match(output, /await Promise\.resolve\('hi'\)/);
-      assert.match(output, /From .*require-execution\.js/);
-      assert.match(output, /Requiring .*execution\.mjs/);
+      // The location of the top-level await is shown with a caret.
+      assert(output.includes(`${fixtures.path('es-modules/tla/execution.mjs')}:3`), output);
+      assert(output.includes("await Promise.resolve('hi');\n^"), output);
+      // The require() chain is shown as a require stack.
+      assert.match(output, /Require stack:/);
+      assert.match(output, /require-execution\.js/);
       return true;
     },
-    stdout: ''
+    stdout: '',
   });
 }

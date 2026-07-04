@@ -1,6 +1,6 @@
 'use strict'
 
-const { Writable } = require('stream')
+const { Writable } = require('node:stream')
 const { assertCacheKey, assertCacheValue } = require('../util/cache.js')
 
 let DatabaseSync
@@ -115,6 +115,11 @@ module.exports = class SqliteCacheStore {
     this.#db = new DatabaseSync(opts?.location ?? ':memory:')
 
     this.#db.exec(`
+      PRAGMA journal_mode = WAL;
+      PRAGMA synchronous = NORMAL;
+      PRAGMA temp_store = memory;
+      PRAGMA optimize;
+
       CREATE TABLE IF NOT EXISTS cacheInterceptorV${VERSION} (
         -- Data specific to us
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -134,9 +139,8 @@ module.exports = class SqliteCacheStore {
         staleAt INTEGER NOT NULL
       );
 
-      CREATE INDEX IF NOT EXISTS idx_cacheInterceptorV${VERSION}_url ON cacheInterceptorV${VERSION}(url);
-      CREATE INDEX IF NOT EXISTS idx_cacheInterceptorV${VERSION}_method ON cacheInterceptorV${VERSION}(method);
-      CREATE INDEX IF NOT EXISTS idx_cacheInterceptorV${VERSION}_deleteAt ON cacheInterceptorV${VERSION}(deleteAt);
+      CREATE INDEX IF NOT EXISTS idx_cacheInterceptorV${VERSION}_getValuesQuery ON cacheInterceptorV${VERSION}(url, method, deleteAt);
+      CREATE INDEX IF NOT EXISTS idx_cacheInterceptorV${VERSION}_deleteByUrlQuery ON cacheInterceptorV${VERSION}(deleteAt);
     `)
 
     this.#getValuesQuery = this.#db.prepare(`
@@ -169,6 +173,7 @@ module.exports = class SqliteCacheStore {
         headers = ?,
         etag = ?,
         cacheControlDirectives = ?,
+        vary = ?,
         cachedAt = ?,
         staleAt = ?
       WHERE
@@ -212,7 +217,7 @@ module.exports = class SqliteCacheStore {
           SELECT
             id
           FROM cacheInterceptorV${VERSION}
-          ORDER BY cachedAt DESC
+          ORDER BY cachedAt ASC
           LIMIT ?
         )
       `)
@@ -274,12 +279,12 @@ module.exports = class SqliteCacheStore {
         value.headers ? JSON.stringify(value.headers) : null,
         value.etag ? value.etag : null,
         value.cacheControlDirectives ? JSON.stringify(value.cacheControlDirectives) : null,
+        value.vary ? JSON.stringify(value.vary) : null,
         value.cachedAt,
         value.staleAt,
         existingValue.id
       )
     } else {
-      this.#prune()
       // New response, let's insert it
       this.#insertValueQuery.run(
         url,
@@ -295,6 +300,7 @@ module.exports = class SqliteCacheStore {
         value.cachedAt,
         value.staleAt
       )
+      this.#prune()
     }
   }
 
@@ -319,7 +325,7 @@ module.exports = class SqliteCacheStore {
       write (chunk, encoding, callback) {
         size += chunk.byteLength
 
-        if (size < store.#maxEntrySize) {
+        if (size <= store.#maxEntrySize) {
           body.push(chunk)
         } else {
           this.destroy()
@@ -346,7 +352,7 @@ module.exports = class SqliteCacheStore {
   }
 
   #prune () {
-    if (this.size <= this.#maxCount) {
+    if (Number.isFinite(this.#maxCount) && this.size <= this.#maxCount) {
       return 0
     }
 
@@ -405,7 +411,7 @@ module.exports = class SqliteCacheStore {
     const now = Date.now()
     for (const value of values) {
       if (now >= value.deleteAt && !canBeExpired) {
-        return undefined
+        continue
       }
 
       let matches = true

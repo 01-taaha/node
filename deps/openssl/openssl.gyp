@@ -49,6 +49,15 @@
             'MODULESDIR="<(modules_dir)"',
           ]
         }],
+        ['node_shared_zlib=="false"', {
+          'dependencies': [ '../zlib/zlib.gyp:zlib' ],
+        }],
+        ['node_shared_brotli=="false"', {
+          'dependencies': [ '../brotli/brotli.gyp:brotli' ],
+        }],
+        ['node_shared_zstd=="false"', {
+          'dependencies': [ '../zstd/zstd.gyp:zstd' ],
+        }],
       ],
       'direct_dependent_settings': {
         'include_dirs': [ 'openssl/include', 'openssl/crypto/include']
@@ -76,6 +85,16 @@
         # Avoid excessive LTO
         ['enable_lto=="true"', {
           'ldflags': [ '-fno-lto' ],
+        }],
+        ['node_with_ltcg=="true" or enable_lto=="true" or enable_thin_lto=="true"', {
+          'msvs_settings': {
+            'VCCLCompilerTool': {
+              'AdditionalOptions': ['-fno-lto'],
+            },
+            'VCLinkerTool': {
+              'AdditionalOptions': ['-fno-lto'],
+            },
+          },
         }],
      ]
     }, {

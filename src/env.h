@@ -42,12 +42,15 @@
 #include "node_main_instance.h"
 #include "node_options.h"
 #include "node_perf_common.h"
+#include "node_profiling.h"
 #include "node_realm.h"
 #include "node_snapshotable.h"
 #include "permission/permission.h"
 #include "req_wrap.h"
 #include "util.h"
 #include "uv.h"
+#include "v8-external-memory-accounter.h"
+#include "v8-profiler.h"
 #include "v8.h"
 
 #if HAVE_OPENSSL
@@ -57,6 +60,7 @@
 #include <array>
 #include <atomic>
 #include <cstdint>
+#include <deque>
 #include <functional>
 #include <list>
 #include <memory>
@@ -65,11 +69,8 @@
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
+#include <variant>
 #include <vector>
-
-namespace v8 {
-class CppHeap;
-}
 
 namespace node {
 
@@ -245,7 +246,6 @@ class NODE_EXTERN_PRIVATE IsolateData : public MemoryRetainer {
   const SnapshotData* snapshot_data_;
   std::optional<SnapshotConfig> snapshot_config_;
 
-  std::unique_ptr<v8::CppHeap> cpp_heap_;
   std::shared_ptr<PerIsolateOptions> options_;
   worker::Worker* worker_context_ = nullptr;
   PerIsolateWrapperData* wrapper_data_;
@@ -257,6 +257,8 @@ class NODE_EXTERN_PRIVATE IsolateData : public MemoryRetainer {
 
 struct ContextInfo {
   explicit ContextInfo(const std::string& name) : name(name) {}
+  ContextInfo(const std::string& name, const std::string& origin)
+      : name(name), origin(origin) {}
   const std::string name;
   std::string origin;
   bool is_default = false;
@@ -325,9 +327,11 @@ class AsyncHooks : public MemoryRetainer {
   // NB: This call does not take (co-)ownership of `execution_async_resource`.
   // The lifetime of the `v8::Local<>` pointee must last until
   // `pop_async_context()` or `clear_async_id_stack()` are called.
-  void push_async_context(double async_id,
-                          double trigger_async_id,
-                          v8::Local<v8::Object> execution_async_resource);
+  void push_async_context(
+      double async_id,
+      double trigger_async_id,
+      std::variant<v8::Local<v8::Object>*, v8::Global<v8::Object>*>
+          execution_async_resource);
   bool pop_async_context(double async_id);
   void clear_async_id_stack();  // Used in fatal exceptions.
 
@@ -389,15 +393,14 @@ class AsyncHooks : public MemoryRetainer {
 
   v8::Global<v8::Array> js_execution_async_resources_;
 
-  // TODO(@jasnell): Note that this is technically illegal use of
-  // v8::Locals which should be kept on the stack. Here, the entries
-  // in this object grows and shrinks with the C stack, and entries
-  // will be in the right handle scopes, but v8::Locals are supposed
-  // to remain on the stack and not the heap. For general purposes
-  // this *should* be ok but may need to be looked at further should
-  // v8 become stricter in the future about v8::Locals being held in
-  // the stack.
-  v8::LocalVector<v8::Object> native_execution_async_resources_;
+  // We avoid storing the handles directly here, because they are already
+  // properly allocated on the stack, we just need access to them here.
+  // The `v8::Global<>` variant is here because the Node-API API design
+  // does not allow us to make sure that we exclusively store this value
+  // on the stack, so we accept the small perf hit that comes with
+  // global handles in that case.
+  std::deque<std::variant<v8::Local<v8::Object>*, v8::Global<v8::Object>*>>
+      native_execution_async_resources_;
 
   // Non-empty during deserialization
   const SerializeInfo* info_ = nullptr;
@@ -664,7 +667,8 @@ class Environment final : public MemoryRetainer {
               const std::vector<std::string>& exec_args,
               const EnvSerializeInfo* env_info,
               EnvironmentFlags::Flags flags,
-              ThreadId thread_id);
+              ThreadId thread_id,
+              std::string_view thread_name = "");
   void InitializeMainContext(v8::Local<v8::Context> context,
                              const EnvSerializeInfo* env_info);
   ~Environment() override;
@@ -696,6 +700,8 @@ class Environment final : public MemoryRetainer {
   void StartProfilerIdleNotifier();
 
   inline v8::Isolate* isolate() const;
+  inline cppgc::AllocationHandle& cppgc_allocation_handle() const;
+  inline v8::ExternalMemoryAccounter* external_memory_accounter() const;
   inline uv_loop_t* event_loop() const;
   void TryLoadAddon(const char* filename,
                     int flags,
@@ -738,6 +744,8 @@ class Environment final : public MemoryRetainer {
   inline void set_exiting(bool value);
   bool exiting() const;
   inline ExitCode exit_code(const ExitCode default_code) const;
+
+  inline void set_exit_code(const ExitCode code);
 
   // This stores whether the --abort-on-uncaught-exception flag was passed
   // to Node.
@@ -807,6 +815,7 @@ class Environment final : public MemoryRetainer {
   inline bool should_start_debug_signal_handler() const;
   inline bool no_browser_globals() const;
   inline uint64_t thread_id() const;
+  inline std::string_view thread_name() const;
   inline worker::Worker* worker_context() const;
   Environment* worker_parent_env() const;
   inline void add_sub_worker_context(worker::Worker* context);
@@ -822,15 +831,15 @@ class Environment final : public MemoryRetainer {
   inline node_module* extra_linked_bindings_tail();
   inline const Mutex& extra_linked_bindings_mutex() const;
 
-  inline bool filehandle_close_warning() const;
-  inline void set_filehandle_close_warning(bool on);
-
   inline void set_source_maps_enabled(bool on);
   inline bool source_maps_enabled() const;
 
   inline void ThrowError(const char* errmsg);
   inline void ThrowTypeError(const char* errmsg);
   inline void ThrowRangeError(const char* errmsg);
+  inline void ThrowStdErrException(std::error_code error_code,
+                                   const char* syscall,
+                                   const char* path = nullptr);
   inline void ThrowErrnoException(int errorno,
                                   const char* syscall = nullptr,
                                   const char* message = nullptr,
@@ -880,7 +889,7 @@ class Environment final : public MemoryRetainer {
   // Get the context with an explicit realm instead when possible.
   // Deprecate soon.
   inline v8::Local<v8::Context> context() const;
-  inline Realm* principal_realm() const;
+  inline PrincipalRealm* principal_realm() const;
 
 #if HAVE_INSPECTOR
   inline inspector::Agent* inspector_agent() const {
@@ -1022,11 +1031,13 @@ class Environment final : public MemoryRetainer {
   void InitializeCompileCache();
   // Enable built-in compile cache if it has not yet been enabled.
   // The cache will be persisted to disk on exit.
-  CompileCacheEnableResult EnableCompileCache(const std::string& cache_dir);
+  CompileCacheEnableResult EnableCompileCache(const std::string& cache_dir,
+                                              EnableOption option);
   void FlushCompileCache();
 
   void RunAndClearNativeImmediates(bool only_refed = false);
   void RunAndClearInterrupts();
+  bool HasNativeImmediates() const;
 
   uv_buf_t allocate_managed_buffer(const size_t suggested_size);
   std::unique_ptr<v8::BackingStore> release_managed_buffer(const uv_buf_t& buf);
@@ -1045,6 +1056,9 @@ class Environment final : public MemoryRetainer {
   inline void AddHeapSnapshotNearHeapLimitCallback();
 
   inline void RemoveHeapSnapshotNearHeapLimitCallback(size_t heap_limit);
+
+  v8::CpuProfilingResult StartCpuProfile(const CpuProfileOptions& options);
+  v8::CpuProfile* StopCpuProfile(v8::ProfilerId profile_id);
 
   // Field identifiers for exit_info_
   enum ExitInfoField {
@@ -1076,6 +1090,7 @@ class Environment final : public MemoryRetainer {
 
   std::list<binding::DLib> loaded_addons_;
   v8::Isolate* const isolate_;
+  v8::ExternalMemoryAccounter* const external_memory_accounter_;
   IsolateData* const isolate_data_;
 
   bool env_handle_initialized_ = false;
@@ -1102,7 +1117,6 @@ class Environment final : public MemoryRetainer {
   bool trace_sync_io_ = false;
   bool emit_env_nonstring_warning_ = true;
   bool emit_err_name_warning_ = true;
-  bool emit_filehandle_warning_ = true;
   bool source_maps_enabled_ = false;
 
   size_t async_callback_scope_depth_ = 0;
@@ -1172,6 +1186,7 @@ class Environment final : public MemoryRetainer {
 
   uint64_t flags_;
   uint64_t thread_id_;
+  std::string thread_name_;
   std::unordered_set<worker::Worker*> sub_worker_contexts_;
 
 #if HAVE_INSPECTOR
@@ -1241,6 +1256,9 @@ class Environment final : public MemoryRetainer {
   // track of the BackingStore for a given pointer.
   std::unordered_map<char*, std::unique_ptr<v8::BackingStore>>
       released_allocated_buffers_;
+
+  v8::CpuProfiler* cpu_profiler_ = nullptr;
+  std::vector<v8::ProfilerId> pending_profiles_;
 };
 
 }  // namespace node

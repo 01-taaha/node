@@ -11,6 +11,7 @@ const {
 const {
   NODE_PERFORMANCE_GC_MAJOR,
   NODE_PERFORMANCE_GC_MINOR,
+  NODE_PERFORMANCE_GC_MINOR_MARK_SWEEP,
   NODE_PERFORMANCE_GC_INCREMENTAL,
   NODE_PERFORMANCE_GC_WEAKCB,
   NODE_PERFORMANCE_GC_FLAGS_FORCED
@@ -19,6 +20,7 @@ const {
 const kinds = [
   NODE_PERFORMANCE_GC_MAJOR,
   NODE_PERFORMANCE_GC_MINOR,
+  NODE_PERFORMANCE_GC_MINOR_MARK_SWEEP,
   NODE_PERFORMANCE_GC_INCREMENTAL,
   NODE_PERFORMANCE_GC_WEAKCB,
 ];
@@ -30,9 +32,7 @@ const kinds = [
     assert(entry);
     assert.strictEqual(entry.name, 'gc');
     assert.strictEqual(entry.entryType, 'gc');
-    assert(kinds.includes(entry.kind));
     assert(kinds.includes(entry.detail.kind));
-    assert.strictEqual(entry.flags, NODE_PERFORMANCE_GC_FLAGS_FORCED);
     assert.strictEqual(entry.detail.flags, NODE_PERFORMANCE_GC_FLAGS_FORCED);
     assert.strictEqual(typeof entry.startTime, 'number');
     assert(entry.startTime < 1e4, 'startTime should be relative to performance.timeOrigin.');
@@ -48,9 +48,9 @@ const kinds = [
 // GC should not keep the event loop alive
 {
   let didCall = false;
-  process.on('beforeExit', () => {
+  process.on('beforeExit', common.mustCall(() => {
     assert(!didCall);
     didCall = true;
     globalThis.gc();
-  });
+  }));
 }

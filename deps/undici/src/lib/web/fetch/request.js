@@ -4,7 +4,6 @@
 
 const { extractBody, mixinBody, cloneBody, bodyUnusable } = require('./body')
 const { Headers, fill: fillHeaders, HeadersList, setHeadersGuard, getHeadersGuard, setHeadersList, getHeadersList } = require('./headers')
-const { FinalizationRegistry } = require('./dispatcher-weakref')()
 const util = require('../../core/util')
 const nodeUtil = require('node:util')
 const {
@@ -23,7 +22,7 @@ const {
   requestDuplex
 } = require('./constants')
 const { kEnumerableProperty, normalizedMethodRecordsBase, normalizedMethodRecords } = util
-const { webidl } = require('./webidl')
+const { webidl } = require('../webidl')
 const { URLSerializer } = require('./data-url')
 const { kConstruct } = require('../../core/symbols')
 const assert = require('node:assert')
@@ -98,6 +97,13 @@ class Request {
 
   #state
 
+  /**
+   * Removes the `abort` listener that makes this request's signal follow the
+   * passed signal. `null` when no such listener was registered.
+   * @type {(() => void) | null}
+   */
+  #abortCleanup = null
+
   // https://fetch.spec.whatwg.org/#dom-request
   constructor (input, init = undefined) {
     webidl.util.markAsUncloneable(this)
@@ -109,8 +115,8 @@ class Request {
     const prefix = 'Request constructor'
     webidl.argumentLengthCheck(arguments, 1, prefix)
 
-    input = webidl.converters.RequestInfo(input, prefix, 'input')
-    init = webidl.converters.RequestInit(init, prefix, 'init')
+    input = webidl.converters.RequestInfo(input)
+    init = webidl.converters.RequestInit(init)
 
     // 1. Let request be null.
     let request = null
@@ -437,12 +443,23 @@ class Request {
           setMaxListeners(1500, signal)
         }
 
-        util.addAbortListener(signal, abort)
+        const removeAbortListener = util.addAbortListener(signal, abort)
         // The third argument must be a registry key to be unregistered.
         // Without it, you cannot unregister.
         // https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/FinalizationRegistry
         // abort is used as the unregister key. (because it is unique)
         requestFinalizer.register(ac, { signal, abort }, abort)
+
+        // Allow the listener to be removed deterministically once the fetch
+        // that owns this request has settled, instead of relying solely on the
+        // FinalizationRegistry (i.e. garbage collection). Reusing a single
+        // signal across many requests would otherwise leak listeners.
+        // See https://github.com/nodejs/undici/issues/5285
+        this.#abortCleanup = () => {
+          requestFinalizer.unregister(abort)
+          removeAbortListener()
+          this.#abortCleanup = null
+        }
       }
     }
 
@@ -869,15 +886,25 @@ class Request {
   static setRequestState (request, newState) {
     request.#state = newState
   }
+
+  /**
+   * Removes the `abort` listener that makes this request's signal follow the
+   * signal passed to its constructor, if any. Idempotent.
+   * @param {Request} request
+   */
+  static removeRequestAbortListener (request) {
+    request.#abortCleanup?.()
+  }
 }
 
-const { setRequestSignal, getRequestDispatcher, setRequestDispatcher, setRequestHeaders, getRequestState, setRequestState } = Request
+const { setRequestSignal, getRequestDispatcher, setRequestDispatcher, setRequestHeaders, getRequestState, setRequestState, removeRequestAbortListener } = Request
 Reflect.deleteProperty(Request, 'setRequestSignal')
 Reflect.deleteProperty(Request, 'getRequestDispatcher')
 Reflect.deleteProperty(Request, 'setRequestDispatcher')
 Reflect.deleteProperty(Request, 'setRequestHeaders')
 Reflect.deleteProperty(Request, 'getRequestState')
 Reflect.deleteProperty(Request, 'setRequestState')
+Reflect.deleteProperty(Request, 'removeRequestAbortListener')
 
 mixinBody(Request, getRequestState)
 
@@ -903,6 +930,7 @@ function makeRequest (init) {
     referrerPolicy: init.referrerPolicy ?? '',
     mode: init.mode ?? 'no-cors',
     useCORSPreflightFlag: init.useCORSPreflightFlag ?? false,
+    // TODO: is this credentials mode? https://fetch.spec.whatwg.org/#concept-request-credentials-mode
     credentials: init.credentials ?? 'same-origin',
     useCredentials: init.useCredentials ?? false,
     cache: init.cache ?? 'default',
@@ -919,6 +947,8 @@ function makeRequest (init) {
     preventNoCacheCacheControlHeaderModification: init.preventNoCacheCacheControlHeaderModification ?? false,
     done: init.done ?? false,
     timingAllowFailed: init.timingAllowFailed ?? false,
+    useURLCredentials: init.useURLCredentials ?? undefined,
+    traversableForUserPrompts: init.traversableForUserPrompts ?? 'client',
     urlList: init.urlList,
     url: init.urlList[0],
     headersList: init.headersList
@@ -937,7 +967,7 @@ function cloneRequest (request) {
   // 2. If request’s body is non-null, set newRequest’s body to the
   // result of cloning request’s body.
   if (request.body != null) {
-    newRequest.body = cloneBody(newRequest, request.body)
+    newRequest.body = cloneBody(request.body)
   }
 
   // 3. Return newRequest.
@@ -993,8 +1023,13 @@ Object.defineProperties(Request.prototype, {
 
 webidl.is.Request = webidl.util.MakeTypeAssertion(Request)
 
-// https://fetch.spec.whatwg.org/#requestinfo
-webidl.converters.RequestInfo = function (V, prefix, argument) {
+/**
+ * @param {*} V
+ * @returns {import('../../../types/fetch').Request|string}
+ *
+ * @see https://fetch.spec.whatwg.org/#requestinfo
+ */
+webidl.converters.RequestInfo = function (V) {
   if (typeof V === 'string') {
     return webidl.converters.USVString(V)
   }
@@ -1006,7 +1041,11 @@ webidl.converters.RequestInfo = function (V, prefix, argument) {
   return webidl.converters.USVString(V)
 }
 
-// https://fetch.spec.whatwg.org/#requestinit
+/**
+ * @param {*} V
+ * @returns {import('../../../types/fetch').RequestInit}
+ * @see https://fetch.spec.whatwg.org/#requestinit
+ */
 webidl.converters.RequestInit = webidl.dictionaryConverter([
   {
     key: 'method',
@@ -1086,6 +1125,12 @@ webidl.converters.RequestInit = webidl.dictionaryConverter([
   {
     key: 'dispatcher', // undici specific option
     converter: webidl.converters.any
+  },
+  {
+    key: 'priority',
+    converter: webidl.converters.DOMString,
+    allowedValues: ['high', 'low', 'auto'],
+    defaultValue: () => 'auto'
   }
 ])
 
@@ -1095,5 +1140,6 @@ module.exports = {
   fromInnerRequest,
   cloneRequest,
   getRequestDispatcher,
-  getRequestState
+  getRequestState,
+  removeRequestAbortListener
 }

@@ -275,6 +275,96 @@ t.test('packs from git spec', async t => {
     const exists = await fs.stat(path.join(npm.prefix, 'npm-exec-test-success'))
     t.ok(exists.isFile(), 'bin ran, creating file')
   } catch (err) {
-    t.fail(err, "shouldn't throw")
+    t.fail(err, 'should not throw')
   }
+})
+
+t.test('can run packages with keywords', async t => {
+  const { npm } = await loadMockNpm(t, {
+    prefixDir: {
+      'package.json': JSON.stringify({
+        name: '@npmcli/npx-package-test',
+        bin: { select: 'index.js' },
+      }),
+      'index.js': `#!/usr/bin/env node
+      require('fs').writeFileSync('npm-exec-test-success', (process.argv.length).toString())`,
+    },
+  })
+
+  try {
+    await npm.exec('exec', ['select'])
+
+    const testFilePath = path.join(npm.prefix, 'npm-exec-test-success')
+    const exists = await fs.stat(testFilePath)
+    t.ok(exists.isFile(), 'bin ran, creating file')
+    const noExtraArgumentCount = await fs.readFile(testFilePath, 'utf8')
+    t.equal(+noExtraArgumentCount, 2, 'should have no extra arguments')
+  } catch (err) {
+    t.fail(err, 'should not throw')
+  }
+})
+
+t.test('exec threads allowScripts policy from .npmrc through to libexec', async t => {
+  let capturedOpts
+  const fakeLibexec = async (opts) => {
+    capturedOpts = opts
+  }
+  const { npm } = await loadMockNpm(t, {
+    prefixDir: {
+      'package.json': JSON.stringify({ name: 'host', version: '1.0.0' }),
+      '.npmrc': 'allow-scripts = canvas',
+    },
+    mocks: {
+      libnpmexec: fakeLibexec,
+    },
+  })
+  await npm.exec('exec', ['some-pkg'])
+  t.strictSame(capturedOpts.allowScripts, { canvas: true },
+    'allowScripts populated from .npmrc layer')
+})
+
+t.test('exec ignores project package.json#allowScripts (RFC: .npmrc-only)', async t => {
+  // Per RFC line 299, exec/npx consults only user/global .npmrc. Project
+  // package.json policy must NOT influence npx behaviour, even when the
+  // user is running npx inside a project that has its own allowScripts.
+  let capturedOpts
+  const { npm } = await loadMockNpm(t, {
+    prefixDir: {
+      'package.json': JSON.stringify({
+        name: 'host',
+        version: '1.0.0',
+        allowScripts: { sharp: true },
+      }),
+    },
+    mocks: {
+      libnpmexec: async (opts) => {
+        capturedOpts = opts
+      },
+    },
+  })
+  await npm.exec('exec', ['some-pkg'])
+  // package.json policy is skipped; no other layer has policy; result is null.
+  t.equal(capturedOpts.allowScripts, null)
+})
+
+t.test('exec reads .npmrc policy even when project package.json has a different policy', async t => {
+  // .npmrc-tier policy wins because package.json is skipped entirely.
+  let capturedOpts
+  const { npm } = await loadMockNpm(t, {
+    prefixDir: {
+      'package.json': JSON.stringify({
+        name: 'host',
+        version: '1.0.0',
+        allowScripts: { sharp: true },
+      }),
+      '.npmrc': 'allow-scripts = canvas',
+    },
+    mocks: {
+      libnpmexec: async (opts) => {
+        capturedOpts = opts
+      },
+    },
+  })
+  await npm.exec('exec', ['some-pkg'])
+  t.strictSame(capturedOpts.allowScripts, { canvas: true })
 })

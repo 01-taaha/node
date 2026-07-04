@@ -296,13 +296,9 @@ int StreamBase::Writev(const FunctionCallbackInfo<Value>& args) {
 
 int StreamBase::WriteBuffer(const FunctionCallbackInfo<Value>& args) {
   CHECK(args[0]->IsObject());
+  CHECK(args[1]->IsUint8Array());
 
   Environment* env = Environment::GetCurrent(args);
-
-  if (!args[1]->IsUint8Array()) {
-    node::THROW_ERR_INVALID_ARG_TYPE(env, "Second argument must be a buffer");
-    return 0;
-  }
 
   Local<Object> req_wrap_obj = args[0].As<Object>();
   uv_buf_t buf;
@@ -401,7 +397,7 @@ int StreamBase::WriteString(const FunctionCallbackInfo<Value>& args) {
     // Copy partial data
     bs = ArrayBuffer::NewBackingStore(
         isolate, buf.len, BackingStoreInitializationMode::kUninitialized);
-    memcpy(static_cast<char*>(bs->Data()), buf.base, buf.len);
+    memcpy(bs->Data(), buf.base, buf.len);
     data_size = buf.len;
   } else {
     // Write it
@@ -653,7 +649,8 @@ void StreamBase::GetExternal(const FunctionCallbackInfo<Value>& args) {
   StreamBase* wrap = StreamBase::FromObject(args.This().As<Object>());
   if (wrap == nullptr) return;
 
-  Local<External> ext = External::New(args.GetIsolate(), wrap);
+  Local<External> ext = External::New(
+      args.GetIsolate(), wrap, v8::kExternalPointerTypeTagDefault);
   args.GetReturnValue().Set(ext);
 }
 
@@ -708,10 +705,9 @@ void EmitToJSStreamListener::OnStreamRead(ssize_t nread, const uv_buf_t& buf_) {
   CHECK_LE(static_cast<size_t>(nread), bs->ByteLength());
   if (static_cast<size_t>(nread) != bs->ByteLength()) {
     std::unique_ptr<BackingStore> old_bs = std::move(bs);
-    bs = ArrayBuffer::NewBackingStore(isolate, nread);
-    memcpy(static_cast<char*>(bs->Data()),
-           static_cast<char*>(old_bs->Data()),
-           nread);
+    bs = ArrayBuffer::NewBackingStore(
+        isolate, nread, BackingStoreInitializationMode::kUninitialized);
+    memcpy(bs->Data(), old_bs->Data(), nread);
   }
 
   stream->CallJSOnreadMethod(nread, ArrayBuffer::New(isolate, std::move(bs)));

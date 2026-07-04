@@ -4,6 +4,9 @@ const common = require('../common');
 if (!common.hasCrypto)
   common.skip('missing crypto');
 
+if (process.features.openssl_is_boringssl)
+  common.skip('BoringSSL does not support FIPS');
+
 const assert = require('assert');
 const spawnSync = require('child_process').spawnSync;
 const path = require('path');
@@ -23,13 +26,16 @@ const FIPS_ENABLE_ERROR_STRING = 'OpenSSL error when trying to enable FIPS:';
 const CNF_FIPS_ON = fixtures.path('openssl_fips_enabled.cnf');
 const CNF_FIPS_OFF = fixtures.path('openssl_fips_disabled.cnf');
 
+const kNoFailure = 0;
+const kGenericUserError = 1;
+
 let num_children_ok = 0;
 
 function sharedOpenSSL() {
   return process.config.variables.node_shared_openssl;
 }
 
-function testHelper(stream, args, expectedOutput, cmd, env) {
+function testHelper(stream, args, expectedStatus, expectedOutput, cmd, env) {
   const fullArgs = args.concat(['-e', `console.log(${cmd})`]);
   const child = spawnSync(process.execPath, fullArgs, {
     cwd: path.dirname(process.execPath),
@@ -56,6 +62,7 @@ function testHelper(stream, args, expectedOutput, cmd, env) {
         // Normal path where we expect either FIPS enabled or disabled.
         assert.strictEqual(getFipsValue, expectedOutput);
     }
+    assert.strictEqual(child.status, expectedStatus);
     childOk(child);
   }
 
@@ -66,6 +73,7 @@ function testHelper(stream, args, expectedOutput, cmd, env) {
 testHelper(
   testFipsCrypto() ? 'stdout' : 'stderr',
   ['--enable-fips'],
+  testFipsCrypto() ? kNoFailure : kGenericUserError,
   testFipsCrypto() ? FIPS_ENABLED : FIPS_ENABLE_ERROR_STRING,
   'process.versions',
   process.env);
@@ -74,6 +82,7 @@ testHelper(
 testHelper(
   testFipsCrypto() ? 'stdout' : 'stderr',
   ['--force-fips'],
+  testFipsCrypto() ? kNoFailure : kGenericUserError,
   testFipsCrypto() ? FIPS_ENABLED : FIPS_ENABLE_ERROR_STRING,
   'process.versions',
   process.env);
@@ -85,6 +94,7 @@ if (!sharedOpenSSL()) {
   testHelper(
     'stdout',
     [],
+    kNoFailure,
     FIPS_DISABLED,
     'require("crypto").getFips()',
     { ...process.env, 'OPENSSL_CONF': ' ' });
@@ -94,6 +104,7 @@ if (!sharedOpenSSL()) {
 testHelper(
   'stderr',
   [],
+  kGenericUserError,
   'Calling crypto.setFips() is not supported in workers',
   'new worker_threads.Worker(\'require("crypto").setFips(true);\', { eval: true })',
   process.env);
@@ -120,6 +131,7 @@ if (!sharedOpenSSL() && !hasOpenSSL3) {
   testHelper(
     'stdout',
     [`--openssl-config=${CNF_FIPS_ON}`],
+    kNoFailure,
     testFipsCrypto() ? FIPS_ENABLED : FIPS_DISABLED,
     'require("crypto").getFips()',
     process.env);
@@ -128,6 +140,7 @@ if (!sharedOpenSSL() && !hasOpenSSL3) {
   testHelper(
     'stdout',
     [],
+    kNoFailure,
     testFipsCrypto() ? FIPS_ENABLED : FIPS_DISABLED,
     'require("crypto").getFips()',
     Object.assign({}, process.env, { 'OPENSSL_CONF': CNF_FIPS_ON }));
@@ -136,6 +149,7 @@ if (!sharedOpenSSL() && !hasOpenSSL3) {
   testHelper(
     'stdout',
     [`--openssl-config=${CNF_FIPS_ON}`],
+    kNoFailure,
     testFipsCrypto() ? FIPS_ENABLED : FIPS_DISABLED,
     'require("crypto").getFips()',
     Object.assign({}, process.env, { 'OPENSSL_CONF': CNF_FIPS_OFF }));
@@ -149,6 +163,7 @@ if (!hasOpenSSL3) {
   testHelper(
     'stdout',
     [`--openssl-config=${CNF_FIPS_OFF}`],
+    kNoFailure,
     FIPS_DISABLED,
     'require("crypto").getFips()',
     Object.assign({}, process.env, { 'OPENSSL_CONF': CNF_FIPS_ON }));
@@ -157,6 +172,7 @@ if (!hasOpenSSL3) {
   testHelper(
     testFipsCrypto() ? 'stdout' : 'stderr',
     ['--enable-fips', `--openssl-config=${CNF_FIPS_OFF}`],
+    testFipsCrypto() ? kNoFailure : kGenericUserError,
     testFipsCrypto() ? FIPS_ENABLED : FIPS_UNSUPPORTED_ERROR_STRING,
     'require("crypto").getFips()',
     process.env);
@@ -164,6 +180,7 @@ if (!hasOpenSSL3) {
   testHelper(
     testFipsCrypto() ? 'stdout' : 'stderr',
     ['--force-fips', `--openssl-config=${CNF_FIPS_OFF}`],
+    testFipsCrypto() ? kNoFailure : kGenericUserError,
     testFipsCrypto() ? FIPS_ENABLED : FIPS_UNSUPPORTED_ERROR_STRING,
     'require("crypto").getFips()',
     process.env);
@@ -171,6 +188,7 @@ if (!hasOpenSSL3) {
   testHelper(
     testFipsCrypto() ? 'stdout' : 'stderr',
     ['--enable-fips'],
+    testFipsCrypto() ? kNoFailure : kGenericUserError,
     testFipsCrypto() ? FIPS_ENABLED : FIPS_UNSUPPORTED_ERROR_STRING,
     'require("crypto").getFips()',
     process.env);
@@ -179,6 +197,7 @@ if (!hasOpenSSL3) {
   testHelper(
     testFipsCrypto() ? 'stdout' : 'stderr',
     ['--force-fips'],
+    testFipsCrypto() ? kNoFailure : kGenericUserError,
     testFipsCrypto() ? FIPS_ENABLED : FIPS_UNSUPPORTED_ERROR_STRING,
     'require("crypto").getFips()',
     process.env);
@@ -187,6 +206,7 @@ if (!hasOpenSSL3) {
   testHelper(
     testFipsCrypto() ? 'stdout' : 'stderr',
     ['--enable-fips'],
+    testFipsCrypto() ? kNoFailure : kGenericUserError,
     testFipsCrypto() ? FIPS_ENABLED : FIPS_UNSUPPORTED_ERROR_STRING,
     'require("crypto").getFips()',
     Object.assign({}, process.env, { 'OPENSSL_CONF': CNF_FIPS_OFF }));
@@ -195,6 +215,7 @@ if (!hasOpenSSL3) {
   testHelper(
     testFipsCrypto() ? 'stdout' : 'stderr',
     ['--force-fips'],
+    testFipsCrypto() ? kNoFailure : kGenericUserError,
     testFipsCrypto() ? FIPS_ENABLED : FIPS_UNSUPPORTED_ERROR_STRING,
     'require("crypto").getFips()',
     Object.assign({}, process.env, { 'OPENSSL_CONF': CNF_FIPS_OFF }));
@@ -203,6 +224,7 @@ if (!hasOpenSSL3) {
   testHelper(
     testFipsCrypto() ? 'stdout' : 'stderr',
     [],
+    testFipsCrypto() ? kNoFailure : kGenericUserError,
     testFipsCrypto() ? FIPS_ENABLED : FIPS_UNSUPPORTED_ERROR_STRING,
     '(require("crypto").setFips(true),' +
     'require("crypto").getFips())',
@@ -212,6 +234,7 @@ if (!hasOpenSSL3) {
   testHelper(
     testFipsCrypto() ? 'stdout' : 'stderr',
     [],
+    testFipsCrypto() ? kNoFailure : kGenericUserError,
     testFipsCrypto() ? FIPS_DISABLED : FIPS_UNSUPPORTED_ERROR_STRING,
     '(require("crypto").setFips(true),' +
     'require("crypto").setFips(false),' +
@@ -222,6 +245,7 @@ if (!hasOpenSSL3) {
   testHelper(
     testFipsCrypto() ? 'stdout' : 'stderr',
     [`--openssl-config=${CNF_FIPS_OFF}`],
+    testFipsCrypto() ? kNoFailure : kGenericUserError,
     testFipsCrypto() ? FIPS_ENABLED : FIPS_UNSUPPORTED_ERROR_STRING,
     '(require("crypto").setFips(true),' +
     'require("crypto").getFips())',
@@ -231,6 +255,7 @@ if (!hasOpenSSL3) {
   testHelper(
     'stdout',
     [`--openssl-config=${CNF_FIPS_ON}`],
+    kNoFailure,
     FIPS_DISABLED,
     '(require("crypto").setFips(false),' +
     'require("crypto").getFips())',
@@ -240,6 +265,7 @@ if (!hasOpenSSL3) {
   testHelper(
     testFipsCrypto() ? 'stdout' : 'stderr',
     ['--enable-fips'],
+    testFipsCrypto() ? kNoFailure : kGenericUserError,
     testFipsCrypto() ? FIPS_DISABLED : FIPS_UNSUPPORTED_ERROR_STRING,
     '(require("crypto").setFips(false),' +
     'require("crypto").getFips())',
@@ -249,6 +275,7 @@ if (!hasOpenSSL3) {
   testHelper(
     'stderr',
     ['--force-fips'],
+    kGenericUserError,
     testFipsCrypto() ? FIPS_ERROR_STRING2 : FIPS_UNSUPPORTED_ERROR_STRING,
     'require("crypto").setFips(false)',
     process.env);
@@ -257,6 +284,7 @@ if (!hasOpenSSL3) {
   testHelper(
     testFipsCrypto() ? 'stdout' : 'stderr',
     ['--force-fips'],
+    testFipsCrypto() ? kNoFailure : kGenericUserError,
     testFipsCrypto() ? FIPS_ENABLED : FIPS_UNSUPPORTED_ERROR_STRING,
     '(require("crypto").setFips(true),' +
     'require("crypto").getFips())',
@@ -266,6 +294,7 @@ if (!hasOpenSSL3) {
   testHelper(
     'stderr',
     ['--force-fips', '--enable-fips'],
+    kGenericUserError,
     testFipsCrypto() ? FIPS_ERROR_STRING2 : FIPS_UNSUPPORTED_ERROR_STRING,
     'require("crypto").setFips(false)',
     process.env);
@@ -274,6 +303,7 @@ if (!hasOpenSSL3) {
   testHelper(
     'stderr',
     ['--enable-fips', '--force-fips'],
+    kGenericUserError,
     testFipsCrypto() ? FIPS_ERROR_STRING2 : FIPS_UNSUPPORTED_ERROR_STRING,
     'require("crypto").setFips(false)',
     process.env);
